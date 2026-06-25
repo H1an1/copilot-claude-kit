@@ -115,9 +115,21 @@ const defaultHaiku = () => pick(["claude-haiku-4.5", "claude-haiku-4"]);
 // id suffixes Copilot exposes as request-time params, not standalone models.
 const VARIANT_RE = /-(?:low|medium|high|xhigh|max|1m)(?:-internal)?$/;
 
+// Claude Desktop only shows the effort selector for models whose id matches
+// Anthropic's canonical dash+date shape (e.g. claude-opus-4-1-20250805). Copilot
+// serves dot-form ids (claude-opus-4.8). So in the /v1/models listing we present
+// the canonical shape (forwardId), and on the request path we convert it back to
+// the dot-form Copilot accepts (handled in normalize()).
+const SENTINEL_DATE = "20260301";
+function forwardId(id) {
+  const m = /^claude-(opus|sonnet|haiku)-(\d+)\.(\d+)$/.exec(id);
+  return m ? `claude-${m[1]}-${m[2]}-${m[3]}-${SENTINEL_DATE}` : id;
+}
+
 function normalize(model) {
   if (typeof model !== "string" || !model) return model;
-  const base = model.trim().replace(/\[[^\]]*\]\s*$/, "");      // strip "[1m]"
+  let base = model.trim().replace(/\[[^\]]*\]\s*$/, "");         // strip "[1m]"
+  base = base.replace(/-\d{8}$/, "");                            // strip date sentinel
   if (supported.has(base)) return base;
   const dotted = base.replace(/^claude-(opus|sonnet|haiku)-(\d+)-(\d+)/, "claude-$1-$2.$3");
   if (supported.has(dotted)) return dotted;
@@ -150,7 +162,9 @@ const server = http.createServer((req, res) => {
             try {
               const j = JSON.parse(out.toString("utf8"));
               if (Array.isArray(j.data)) {
-                j.data = j.data.filter((m) => !(typeof m.id === "string" && /^claude-/.test(m.id) && VARIANT_RE.test(m.id)));
+                j.data = j.data
+                  .filter((m) => !(typeof m.id === "string" && /^claude-/.test(m.id) && VARIANT_RE.test(m.id)))
+                  .map((m) => (typeof m.id === "string" ? { ...m, id: forwardId(m.id) } : m));
                 out = Buffer.from(JSON.stringify(j), "utf8");
               }
             } catch {}
