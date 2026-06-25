@@ -49,6 +49,18 @@ The installer:
    subagents), not just a shell alias.
 5. Verifies the whole chain end-to-end before declaring success.
 
+## Limitations
+
+- **Context window is 200k, not 1M.** Copilot's `vscode-chat` integration (what
+  the proxy uses) doesn't expose any 1M-context Claude variant — its model list
+  has no `-1m` ids, and the `anthropic-beta: context-1m` header isn't honored.
+  Picking "1M context" in a model picker gains nothing (the `[1m]` suffix is
+  normalized away to the standard 200k model). 200k is the honest ceiling here.
+- **Effort/model in Claude Desktop is controlled by the app, not the proxy.** If
+  Claude Desktop is in **Auto** model mode it picks model + effort for you and
+  hides the effort control; switch the model selector from *Auto* to a specific
+  model to reveal the effort tiers.
+
 ## Manage it
 
 ```sh

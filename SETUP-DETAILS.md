@@ -704,6 +704,18 @@ curl -s -m 20 http://localhost:4142/v1/messages \
 
 ---
 
+## Known limitations of the Copilot path
+
+- **Context window is 200k, not 1M.** Copilot's `vscode-chat` integration (the one copilot-api uses)
+  exposes no 1M-context Claude variant — its model list contains no `-1m` ids, and the
+  `anthropic-beta: context-1m-*` header is silently ignored. Choosing a "1M context" model option gains
+  nothing: the `[1m]` suffix is normalized away to the standard 200k model. 200k is the real ceiling.
+- **Effort / model selection in Claude Desktop is the app's, not the proxy's.** If Claude Desktop is in
+  **Auto** model mode it auto-picks model + effort and hides the effort control; switch the model selector
+  from *Auto* to a specific model to reveal the effort tiers (low/medium/high).
+
+---
+
 ## The honest summary
 
 You get the real Claude Code harness with a Copilot-served brain, fully backgrounded. The two things
