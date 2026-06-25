@@ -49,6 +49,29 @@ The installer:
    subagents), not just a shell alias.
 5. Verifies the whole chain end-to-end before declaring success.
 
+## Codex (optional — gpt-5.x via Copilot)
+
+You can also run **OpenAI Codex CLI** on Copilot's models. Codex uses the
+Responses API, which Copilot serves for `gpt-5.x` (including `gpt-5.5`). The
+installer can wire it up:
+
+```sh
+bash install.sh --with-codex     # writes a Codex profile + sets up the proxy
+codex --profile copilot          # run Codex on Copilot
+```
+
+This adds a `/responses` passthrough to the local proxy (copilot-api doesn't
+proxy Responses itself) and writes a self-contained Codex profile at
+`~/.codex/copilot.config.toml` (`model = "gpt-5.5"`, pointed at the proxy). Your
+base `~/.codex/config.toml` is left untouched — it's a `--profile` overlay.
+
+> ### ⚠️ Extra caution for Codex on a corporate/enterprise Copilot seat
+> The Codex path talks to Copilot's **Responses** endpoint while presenting the
+> `vscode-chat` integration identity. On an **enterprise** seat this widens the
+> unsanctioned-usage surface beyond the Claude path. Treat it as a real
+> compliance risk, not just a possible ban. Only enable it if that's acceptable
+> for your context.
+
 ## Limitations
 
 - **Context window is 200k, not 1M.** Copilot's `vscode-chat` integration (what
@@ -60,6 +83,10 @@ The installer:
   Claude Desktop is in **Auto** model mode it picks model + effort for you and
   hides the effort control; switch the model selector from *Auto* to a specific
   model to reveal the effort tiers.
+- **Codex flagship `gpt-5.3-codex` may be gated.** Copilot's `vscode-chat`
+  integration serves `gpt-5.5`/`gpt-5.4` over Responses; some codex-tuned ids are
+  restricted to other integrations and may return `model_not_supported`. Edit
+  `model` in `~/.codex/copilot.config.toml` to one that works for your seat.
 
 ## Manage it
 

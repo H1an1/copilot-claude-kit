@@ -8,6 +8,7 @@
 #
 # Usage:
 #   bash install.sh              # install / repair (idempotent)
+#   bash install.sh --with-codex # also set up OpenAI Codex on Copilot (gpt-5.x)
 #   bash install.sh --verify     # health-check an existing install (doctor)
 #   bash install.sh --uninstall  # remove everything this script created
 #   bash install.sh --help
@@ -72,16 +73,70 @@ write_normalizer() {
  *      trailing assistant/system message);
  *   3. hides -1m/-high/-xhigh variant ids from GET /v1/models so the client's
  *      /model picker only shows ids Copilot can actually serve.
- * It has no dependencies and auto-discovers the live model list.
+ * It also adds a /responses passthrough so OpenAI-style clients (e.g. Codex)
+ * can reach Copilot's native Responses API — which copilot-api doesn't proxy —
+ * unlocking models (gpt-5.x) that Copilot only serves over /responses. It has
+ * no dependencies and auto-discovers the live model list.
  */
 const http = require("http");
+const fs = require("fs");
+const { Readable } = require("stream");
 
 const UPSTREAM_HOST = "127.0.0.1";
 const UPSTREAM_PORT = 4141;          // copilot-api
 const LISTEN_PORT = 4142;            // what clients point at
+const GH_TOKEN_FILE = `${process.env.HOME}/.local/share/copilot-api/github_token`;
 
 let supported = new Set();           // live ids copilot-api accepts
 let lastFetch = 0;
+
+// --- Copilot token exchange (for the /responses passthrough) ----------------
+// copilot-api stores the long-lived GitHub OAuth token on disk. We exchange it
+// for a short-lived Copilot token (and discover the right API host, which is
+// the enterprise host on enterprise seats), caching until just before expiry.
+let copilotToken = null, copilotApi = null, copilotTokenExp = 0;
+async function getCopilotToken() {
+  const now = Math.floor(Date.now() / 1000);
+  if (copilotToken && now < copilotTokenExp - 60) return { token: copilotToken, api: copilotApi };
+  const ght = fs.readFileSync(GH_TOKEN_FILE, "utf8").trim();
+  const r = await fetch("https://api.github.com/copilot_internal/v2/token", {
+    headers: {
+      authorization: "token " + ght,
+      "editor-version": "vscode/1.99.0",
+      "user-agent": "GithubCopilot/1.155.0",
+    },
+  });
+  if (!r.ok) throw new Error("token exchange failed: HTTP " + r.status);
+  const j = await r.json();
+  copilotToken = j.token;
+  copilotTokenExp = j.expires_at || (now + 1500);
+  copilotApi = (j.endpoints && j.endpoints.api) || "https://api.githubcopilot.com";
+  return { token: copilotToken, api: copilotApi };
+}
+
+function copilotHeaders(token, accept) {
+  return {
+    authorization: "Bearer " + token,
+    "content-type": "application/json",
+    "copilot-integration-id": "vscode-chat",
+    "editor-version": "vscode/1.99.0",
+    "editor-plugin-version": "copilot-chat/0.26.0",
+    "user-agent": "GitHubCopilotChat/0.26.0",
+    "openai-intent": "conversation-edits",
+    accept: accept || "text/event-stream",
+  };
+}
+
+// OpenAI "hosted" tool types that Copilot's Responses endpoint rejects. Codex's
+// own coding tools are function/local_shell/custom and are NOT in this set.
+const HOSTED_TOOLS = new Set([
+  "image_generation", "web_search", "web_search_preview", "web_search_2025_08_26",
+  "code_interpreter", "file_search", "computer_use", "computer_use_preview",
+]);
+
+// Request params Copilot's Responses endpoint doesn't accept (Codex sends some
+// OpenAI-platform-only fields). Stripped before forwarding.
+const UNSUPPORTED_PARAMS = ["service_tier", "store", "safety_identifier", "prompt_cache_key"];
 
 function refreshModels() {
   return new Promise((resolve) => {
@@ -147,6 +202,57 @@ const server = http.createServer((req, res) => {
   req.on("end", async () => {
     let body = Buffer.concat(chunks);
     if (Date.now() - lastFetch > 30000) await refreshModels();
+
+    // --- Responses API passthrough (Codex etc.) ---------------------------
+    // copilot-api has no /responses route, and Copilot serves gpt-5.x only over
+    // /responses. We forward straight to Copilot's native Responses endpoint
+    // using a freshly-exchanged Copilot token, streaming the result back.
+    if (req.method === "POST" && /^\/(v1\/)?responses\b/.test(req.url)) {
+      if (body.length) {
+        try {
+          const j = JSON.parse(body.toString("utf8"));
+          if (typeof j.model === "string") {
+            const fixed = normalize(j.model);
+            if (fixed !== j.model) { console.error(`[responses] ${j.model} -> ${fixed}`); j.model = fixed; }
+          }
+          // Copilot's Responses endpoint rejects OpenAI hosted tools (e.g.
+          // image_generation, web_search). Drop them; keep Codex's own
+          // function/shell tools so coding still works.
+          if (Array.isArray(j.tools)) {
+            const before = j.tools.length;
+            j.tools = j.tools.filter((t) => t && !HOSTED_TOOLS.has(t.type));
+            if (j.tools.length !== before) console.error(`[responses] stripped ${before - j.tools.length} hosted tool(s)`);
+          }
+          // Drop request params Copilot's Responses endpoint doesn't accept.
+          for (const k of UNSUPPORTED_PARAMS) if (k in j) { delete j[k]; }
+          body = Buffer.from(JSON.stringify(j), "utf8");
+        } catch { /* forward as-is */ }
+      }
+      let auth;
+      try { auth = await getCopilotToken(); }
+      catch (e) {
+        res.writeHead(502, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "responses passthrough: " + e.message } }));
+        return;
+      }
+      try {
+        const up = await fetch(auth.api + "/responses", {
+          method: "POST",
+          headers: copilotHeaders(auth.token, req.headers["accept"]),
+          body,
+        });
+        const h = {};
+        const ct = up.headers.get("content-type");
+        if (ct) h["content-type"] = ct;
+        res.writeHead(up.status, h);
+        if (up.body) Readable.fromWeb(up.body).pipe(res);
+        else res.end(await up.text());
+      } catch (e) {
+        res.writeHead(502, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "responses upstream error: " + e.message } }));
+      }
+      return;
+    }
 
     // --- Hide variant ids from the model picker (GET /v1/models) ----------
     if (req.method === "GET" && req.url.startsWith("/v1/models")) {
@@ -371,6 +477,43 @@ smoke_test() {  # send a dash-form id through the normalizer; expect a real mess
   case "$out" in *'"type":"message"'*) return 0 ;; *) return 1 ;; esac
 }
 
+CODEX_PROFILE="$HOME/.codex/copilot.config.toml"
+write_codex_profile() {
+  mkdir -p "$HOME/.codex"
+  [ -f "$CODEX_PROFILE" ] && cp "$CODEX_PROFILE" "$CODEX_PROFILE.bak"
+  cat > "$CODEX_PROFILE" <<EOF
+# Written by copilot-claude-kit (bash install.sh --with-codex).
+# A self-contained Codex profile — use it with:   codex --profile copilot
+# It routes Codex through the local proxy to GitHub Copilot's Responses API,
+# which is how gpt-5.x models are served. Edit 'model' to taste.
+model = "gpt-5.5"
+model_provider = "copilot"
+
+[model_providers.copilot]
+name = "GitHub Copilot (local proxy)"
+base_url = "http://localhost:${NORM_PORT}/v1"
+wire_api = "responses"
+EOF
+  ok "wrote Codex profile: $CODEX_PROFILE"
+}
+
+codex_smoke_test() {  # POST /v1/responses through the normalizer; expect a completed response
+  local out
+  out="$(curl -fsS -m 40 "http://localhost:${NORM_PORT}/v1/responses" \
+    -H 'content-type: application/json' \
+    -d '{"model":"gpt-5.5","input":"reply with exactly one word: pong","stream":false}' 2>/dev/null)" || return 1
+  case "$out" in *'"status":"completed"'*|*'"output"'*) return 0 ;; *) return 1 ;; esac
+}
+
+do_with_codex() {
+  do_install
+  step "Setting up Codex (GitHub Copilot via Responses API)"
+  write_codex_profile
+  if codex_smoke_test; then ok "Codex round-trip through :$NORM_PORT/v1/responses succeeded"; else warn "Codex self-test didn't complete; the proxy is up — try 'codex --profile copilot'"; fi
+  printf '\n%s%s Codex ready.%s Run: %scodex --profile copilot%s\n' "$G" "$B" "$X" "$B" "$X"
+  command -v codex >/dev/null 2>&1 || warn "codex CLI not found on PATH — install it, then use 'codex --profile copilot'"
+}
+
 # ===========================================================================
 #  commands
 # ===========================================================================
@@ -443,6 +586,7 @@ do_install() {
 
   printf '\n%s%s All set.%s Open a NEW terminal and run: %sclaude%s\n' "$G" "$B" "$X" "$B" "$X"
   say "Claude Desktop's built-in Claude Code will use this automatically too."
+  say "Add Codex (gpt-5.x):   bash install.sh --with-codex"
   say "Health-check anytime:  bash install.sh --verify"
   say "Remove everything:     bash install.sh --uninstall"
 }
@@ -468,6 +612,11 @@ do_verify() {
 
   step "End-to-end self-test"
   if smoke_test; then ok "round-trip through :$NORM_PORT succeeded"; else err "smoke test failed — check /tmp/com.copilot-api.err"; fail=1; fi
+
+  if [ -f "$CODEX_PROFILE" ]; then
+    step "Codex check"
+    if codex_smoke_test; then ok "Codex /v1/responses round-trip succeeded"; else err "Codex self-test failed — check /tmp/com.copilot-api-normalize.err"; fail=1; fi
+  fi
 
   echo
   if [ "$fail" -eq 0 ]; then ok "${B}Everything looks healthy.${X}"; else err "${B}Some checks failed (see above).${X} Re-run 'bash install.sh' to repair."; exit 1; fi
@@ -500,6 +649,10 @@ NODE_EOF
     ok "cleaned settings.json"
   fi
 
+  if [ -f "$CODEX_PROFILE" ]; then
+    rm -f "$CODEX_PROFILE" && ok "removed Codex profile ($CODEX_PROFILE)"
+  fi
+
   say ""
   warn "Left in place (remove manually if you want): copilot-api npm package and your Copilot auth token."
   say "  npm rm -g copilot-api"
@@ -509,6 +662,7 @@ NODE_EOF
 
 case "${1:-}" in
   ""|install)   do_install ;;
+  --with-codex|with-codex) do_with_codex ;;
   --verify|verify|doctor) do_verify ;;
   --uninstall|uninstall)  do_uninstall ;;
   --help|-h|help)
