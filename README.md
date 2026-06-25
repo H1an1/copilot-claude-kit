@@ -91,6 +91,11 @@ bash install.sh --verify
 - **`400` errors in `claude`** → almost always the normalizer isn't on the path.
   `bash install.sh --verify` will catch it; re-running the installer repairs it.
   Logs: `/tmp/com.copilot-api.err` and `/tmp/com.copilot-api-normalize.err`.
+- **Can't change model or effort in Claude Code / Claude Desktop (picker is locked)**
+  → an env var is pinning the model. This installer does **not** pin `ANTHROPIC_MODEL`
+  for exactly this reason; re-run `bash install.sh` to remove a stale pin, then
+  restart the app (Claude Desktop: `Cmd+Q` and reopen). The model picker and effort
+  control become yours again — the normalizer keeps whatever you pick valid.
 - **"Node.js not found"** → install Node (`brew install node`) and re-run.
 - **Token expired (401 later on)** → re-run `bash install.sh` to re-authorize.
 

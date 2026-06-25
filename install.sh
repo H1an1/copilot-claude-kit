@@ -332,13 +332,18 @@ d.env = d.env || {};
 Object.assign(d.env, {
   ANTHROPIC_BASE_URL: "http://localhost:4142",
   ANTHROPIC_AUTH_TOKEN: "dummy",
-  ANTHROPIC_MODEL: "claude-opus-4.8",
+  // NOTE: we deliberately do NOT pin ANTHROPIC_MODEL. Pinning it locks the
+  // in-app model/effort picker in Claude Code & Claude Desktop ("model is set
+  // by ANTHROPIC_MODEL"), so you can't change effort. The normalizer maps
+  // whatever model id the app sends, so pinning is unnecessary.
   ANTHROPIC_SMALL_FAST_MODEL: "claude-haiku-4.5",
   CLAUDE_CODE_DISABLE_LEGACY_MODEL_REMAP: "1",
   CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1",
   DISABLE_PROMPT_CACHING: "1",
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
 });
+// If an older install pinned the main model, remove it so the picker unlocks.
+delete d.env.ANTHROPIC_MODEL;
 fs.writeFileSync(path, JSON.stringify(d, null, 2));
 console.log("  merged env into " + path + (fs.existsSync(path + ".bak") ? " (backup: " + path + ".bak)" : ""));
 NODE_EOF
