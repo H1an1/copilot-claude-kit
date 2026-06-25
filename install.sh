@@ -382,7 +382,15 @@ do_install() {
     say "A device code will appear below. Open the URL, enter the code, approve Copilot access."
     say "${B}This is the only manual step.${X}"
     echo
-    "$COPILOT_API_BIN" auth || warn "auth command exited non-zero; if you completed it in the browser, that's usually fine"
+    # copilot-api auth just prints the device code/URL and polls GitHub — it
+    # needs no stdin. But when this script is run via `curl | bash`, stdin is
+    # the script text, so attach the real terminal if one is available, in case
+    # a future version prompts.
+    if [ -r /dev/tty ]; then
+      "$COPILOT_API_BIN" auth < /dev/tty || warn "auth exited non-zero; if you approved it in the browser, that's usually fine"
+    else
+      "$COPILOT_API_BIN" auth || warn "auth exited non-zero; if you approved it in the browser, that's usually fine"
+    fi
     echo
     # auth writes the token; restart copilot-api so it picks it up
     load_service "$API_PLIST" "com.copilot-api"
