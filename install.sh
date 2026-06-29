@@ -322,7 +322,7 @@ const server = http.createServer((req, res) => {
         // reports "command missing". Pin max_tokens to the model's real ceiling
         // (per Copilot: 32k/64k) so even the longest pipeline fits; clamp down
         // if a client asked for more than the model allows (avoids HTTP 400).
-        const maxOut = modelMaxOut.get(j.model) || modelCeiling(j.model);
+        const maxOut = j.stream === false ? 16000 : (modelMaxOut.get(j.model) || modelCeiling(j.model));
         if (j.max_tokens !== maxOut) {
           console.error(`[normalize] max_tokens ${j.max_tokens} -> ${maxOut}`);
           j.max_tokens = maxOut;
@@ -406,6 +406,23 @@ ensure_copilot_api() {
     COPILOT_API_BIN="$(command -v copilot-api)" || die "copilot-api still not on PATH after install."
     ok "installed copilot-api: $COPILOT_API_BIN"
   fi
+  patch_copilot_api
+}
+
+# copilot-api collapses Claude extended-thinking blocks to plain text and drops
+# the thinking/reasoning_effort knobs, so opus "thinks" only superficially. We
+# patch its translator to forward reasoning_effort and surface reasoning_text as
+# Anthropic thinking blocks. Idempotent; re-applies after every reinstall.
+patch_copilot_api() {
+  local m; m="$(npm root -g 2>/dev/null)/copilot-api/dist/main.js"
+  [ -f "$m" ] || return 0
+  node -e '
+    const f=process.argv[1]; const fs=require("fs"); let s=fs.readFileSync(f,"utf8");
+    if (s.includes("reasoning_effort: payload.thinking")) process.exit(0);
+    s=s.replace("tool_choice: translateAnthropicToolChoiceToOpenAI(payload.tool_choice)\n\t};","tool_choice: translateAnthropicToolChoiceToOpenAI(payload.tool_choice),\n\t\treasoning_effort: payload.thinking?.type===\"enabled\"?\"high\":void 0\n\t};");
+    s=s.replace("content: [...allTextBlocks, ...allToolUseBlocks],","content: [...(response.choices[0]?.message?.reasoning_text?[{type:\"thinking\",thinking:response.choices[0].message.reasoning_text,signature:\"\"}]:[]), ...allTextBlocks, ...allToolUseBlocks],");
+    fs.writeFileSync(f,s);
+  ' "$m" 2>/dev/null && ok "patched copilot-api for extended thinking" || warn "thinking patch skipped"
 }
 
 write_plist() {  # $1=path $2=label $3..=program args
