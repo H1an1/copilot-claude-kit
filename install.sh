@@ -88,6 +88,7 @@ const LISTEN_PORT = 4142;            // what clients point at
 const GH_TOKEN_FILE = `${process.env.HOME}/.local/share/copilot-api/github_token`;
 
 let supported = new Set();           // live ids copilot-api accepts
+let modelMaxOut = new Map();         // id -> real max_output_tokens (per Copilot)
 let lastFetch = 0;
 
 // --- Copilot token exchange (for the /responses passthrough) ----------------
@@ -147,7 +148,11 @@ function refreshModels() {
         r.on("data", (c) => (b += c));
         r.on("end", () => {
           try {
-            supported = new Set(JSON.parse(b).data.map((m) => m.id));
+            const data = JSON.parse(b).data;
+            supported = new Set(data.map((m) => m.id));
+            modelMaxOut = new Map(
+              data.map((m) => [m.id, m?.capabilities?.limits?.max_output_tokens || 0])
+            );
             lastFetch = Date.now();
           } catch {}
           resolve();
@@ -169,6 +174,16 @@ const defaultHaiku = () => pick(["claude-haiku-4.5", "claude-haiku-4"]);
 
 // id suffixes Copilot exposes as request-time params, not standalone models.
 const VARIANT_RE = /-(?:low|medium|high|xhigh|max|1m)(?:-internal)?$/;
+
+// Real Copilot output ceilings (copilot-api's /v1/models hides capabilities, so
+// we fall back to these verified values). Older 4.5-class models cap at 32k;
+// opus/sonnet 4.6+ and haiku 4.5 at 64k. Sending more yields HTTP 400.
+function modelCeiling(id) {
+  if (typeof id !== "string") return 32000;
+  if (/claude-(opus|sonnet)-4\.5$/.test(id)) return 32000;
+  if (/^claude-/.test(id)) return 64000;
+  return 32000;
+}
 
 // Claude Desktop only shows the effort selector for models whose id matches
 // Anthropic's canonical dash+date shape (e.g. claude-opus-4-1-20250805). Copilot
@@ -300,6 +315,18 @@ const server = http.createServer((req, res) => {
             j.model = fixed;
             changed = true;
           }
+        }
+        // Maximize the output budget so tool_use arguments can never get cut
+        // off mid-stream. A starved budget truncates a long tool call, leaving
+        // an unclosed input_json_delta -> the harness leaks <invoke> as text or
+        // reports "command missing". Pin max_tokens to the model's real ceiling
+        // (per Copilot: 32k/64k) so even the longest pipeline fits; clamp down
+        // if a client asked for more than the model allows (avoids HTTP 400).
+        const maxOut = modelMaxOut.get(j.model) || modelCeiling(j.model);
+        if (j.max_tokens !== maxOut) {
+          console.error(`[normalize] max_tokens ${j.max_tokens} -> ${maxOut}`);
+          j.max_tokens = maxOut;
+          changed = true;
         }
         // Copilot requires the conversation to END WITH A USER MESSAGE.
         if (Array.isArray(j.messages) && j.messages.length > 1) {
