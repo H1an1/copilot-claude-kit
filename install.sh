@@ -20,6 +20,9 @@
 #   copilot-api  @ :4141   reverse-engineered Anthropic-compatible Copilot proxy
 #   normalizer   @ :4142   ~50-line shim: rewrites model ids Copilot rejects,
 #                          fixes trailing-message quirks, hides variant ids
+#   watchdog     (periodic) probes :4141/:4142 every 90s and kickstarts a wedged
+#                          daemon — fixes the "works, then after sleep/reboot I
+#                          have to re-run the installer" problem automatically
 #   ~/.claude/settings.json env -> points Claude Code at :4142 in every launch
 #
 # Heads-up: copilot-api is a reverse-engineered proxy. Using your Copilot
@@ -47,9 +50,12 @@ NORMALIZER="$KIT_DIR/model-normalizer.js"
 LA_DIR="$HOME/Library/LaunchAgents"
 API_PLIST="$LA_DIR/com.copilot-api.plist"
 NORM_PLIST="$LA_DIR/com.copilot-api-normalize.plist"
+WATCHDOG="$KIT_DIR/watchdog.sh"
+WATCHDOG_PLIST="$LA_DIR/com.copilot-api-watchdog.plist"
 SETTINGS="$HOME/.claude/settings.json"
 API_PORT=4141
 NORM_PORT=4142
+WATCHDOG_INTERVAL=90
 GH_TOKEN_FILE="$HOME/.local/share/copilot-api/github_token"
 
 # ===========================================================================
@@ -370,6 +376,88 @@ NORMALIZER_EOF
   ok "normalizer written to $NORMALIZER"
 }
 
+# ===========================================================================
+#  watchdog.sh  (embedded so users never copy-paste it)
+# ===========================================================================
+# launchd's KeepAlive only keeps the PROCESS alive, not the process HEALTHY.
+# After sleep/wake or a network blip, copilot-api's node process is often still
+# "running" (so KeepAlive never restarts it) but its socket is wedged — the port
+# stops answering. That is exactly why re-running this installer "fixes" a dead
+# setup: it is NOT re-authenticating (the GitHub token is still on disk), it is
+# just reloading the daemons. The watchdog automates that: probe the exit ports,
+# and kickstart -k whichever service is wedged. No auth involved.
+write_watchdog() {
+  mkdir -p "$KIT_DIR"
+  cat > "$WATCHDOG" <<'WATCHDOG_EOF'
+#!/usr/bin/env bash
+#
+# copilot-api watchdog
+# --------------------
+# Probes the exit ports (:4141 copilot-api, :4142 normalizer). If one is wedged
+# — process alive but socket dead, the failure launchd's KeepAlive can't see —
+# kickstart -k rebuilds it. This is what a manual installer re-run does for you,
+# minus the parts that never needed doing. It does NOT touch authentication.
+#
+# If :4141 is STILL down after a kickstart, the GitHub token has most likely
+# expired (kickstart can't fix that) — logged + a throttled macOS notification
+# tells you to run `copilot-api auth` once. That's the only human-needed case.
+#
+# Runs as a periodic launchd job (StartInterval), not a resident process.
+set -uo pipefail
+
+UID_N="$(id -u)"
+LOG="/tmp/com.copilot-api-watchdog.log"
+NOTIFY_STAMP="/tmp/com.copilot-api-watchdog.notified"
+NOTIFY_THROTTLE=3600          # seconds between "re-auth needed" notifications
+API_PORT=4141                 # copilot-api
+NORM_PORT=4142                # normalizer
+API_LABEL="com.copilot-api"
+NORM_LABEL="com.copilot-api-normalize"
+
+stamp() { date '+%Y-%m-%d %H:%M:%S'; }
+log()   { printf '%s %s\n' "$(stamp)" "$*" >> "$LOG"; }
+check() { curl -fsS -m 5 "http://localhost:$1/v1/models" >/dev/null 2>&1; }
+kick()  { launchctl kickstart -k "gui/$UID_N/$1" >/dev/null 2>&1; }
+
+notify_reauth() {
+  local now last=0
+  now="$(date +%s)"
+  [ -f "$NOTIFY_STAMP" ] && last="$(cat "$NOTIFY_STAMP" 2>/dev/null || echo 0)"
+  if [ $((now - last)) -ge "$NOTIFY_THROTTLE" ]; then
+    osascript -e 'display notification "Run: copilot-api auth (token expired)" with title "copilot-api needs re-auth"' >/dev/null 2>&1 || true
+    printf '%s' "$now" > "$NOTIFY_STAMP"
+  fi
+}
+
+healed=0
+
+if ! check "$API_PORT"; then
+  log ":$API_PORT ($API_LABEL) not answering -> kickstart -k"
+  kick "$API_LABEL"; healed=1; sleep 5
+fi
+
+# Probed after :4141 because the normalizer proxies to it; if upstream was down,
+# giving it a moment first avoids a needless restart.
+if ! check "$NORM_PORT"; then
+  log ":$NORM_PORT ($NORM_LABEL) not answering -> kickstart -k"
+  kick "$NORM_LABEL"; healed=1; sleep 3
+fi
+
+# Second look: distinguish "wedged process" (healed) from "token expired".
+if ! check "$API_PORT"; then
+  log ":$API_PORT STILL down after kickstart — GitHub token likely expired; run 'copilot-api auth'"
+  notify_reauth
+elif [ "$healed" -eq 1 ]; then
+  log "recovered: :$API_PORT and :$NORM_PORT answering again"
+  rm -f "$NOTIFY_STAMP" 2>/dev/null || true
+fi
+
+exit 0
+WATCHDOG_EOF
+  chmod +x "$WATCHDOG"
+  ok "watchdog written to $WATCHDOG"
+}
+
 # ----- helpers -------------------------------------------------------------
 need_macos() {
   [ "$(uname -s)" = "Darwin" ] || die "This installer targets macOS. See the README for manual Linux steps."
@@ -453,6 +541,42 @@ ${args}  </array>
   <string>/tmp/${label}.log</string>
   <key>StandardErrorPath</key>
   <string>/tmp/${label}.err</string>
+</dict>
+</plist>
+EOF
+}
+
+# The watchdog is a PERIODIC job, not a resident daemon: StartInterval + RunAtLoad
+# and deliberately NO KeepAlive (write_plist hardcodes KeepAlive, which would make
+# it run forever instead of every WATCHDOG_INTERVAL seconds). After sleep/wake,
+# launchd runs a missed interval promptly, so "just woke up" is covered too.
+write_watchdog_plist() {
+  mkdir -p "$LA_DIR"
+  cat > "$WATCHDOG_PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.copilot-api-watchdog</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>${WATCHDOG}</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>${NODE_DIR}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>StartInterval</key>
+  <integer>${WATCHDOG_INTERVAL}</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/com.copilot-api-watchdog.out</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/com.copilot-api-watchdog.err</string>
 </dict>
 </plist>
 EOF
@@ -618,6 +742,12 @@ do_install() {
     die "normalizer didn't come up. Check /tmp/com.copilot-api-normalize.err"
   fi
 
+  step "Installing the watchdog (auto-heals a wedged daemon after sleep/reboot)"
+  write_watchdog
+  write_watchdog_plist
+  load_service "$WATCHDOG_PLIST" "com.copilot-api-watchdog"
+  ok "watchdog active — probes :$API_PORT/:$NORM_PORT every ${WATCHDOG_INTERVAL}s"
+
   step "Pointing Claude Code at the proxy (~/.claude/settings.json)"
   merge_settings
 
@@ -642,6 +772,7 @@ do_verify() {
 
   if service_loaded com.copilot-api; then ok "launchd: com.copilot-api loaded"; else err "launchd: com.copilot-api NOT loaded"; fail=1; fi
   if service_loaded com.copilot-api-normalize; then ok "launchd: com.copilot-api-normalize loaded"; else err "launchd: com.copilot-api-normalize NOT loaded"; fail=1; fi
+  if service_loaded com.copilot-api-watchdog; then ok "launchd: com.copilot-api-watchdog loaded"; else warn "launchd: com.copilot-api-watchdog NOT loaded (auto-heal off; re-run: bash install.sh)"; fi
 
   if curl -fsS -m 3 "http://localhost:$API_PORT/v1/models" >/dev/null 2>&1; then ok ":$API_PORT copilot-api responding"; else err ":$API_PORT copilot-api not responding"; fail=1; fi
   if curl -fsS -m 3 "http://localhost:$NORM_PORT/v1/models" >/dev/null 2>&1; then ok ":$NORM_PORT normalizer responding"; else err ":$NORM_PORT normalizer not responding"; fail=1; fi
@@ -671,8 +802,11 @@ do_uninstall() {
   step "Uninstalling"
   launchctl unload "$API_PLIST" >/dev/null 2>&1 || true
   launchctl unload "$NORM_PLIST" >/dev/null 2>&1 || true
-  rm -f "$API_PLIST" "$NORM_PLIST" && ok "removed launchd services"
-  rm -f "$NORMALIZER" && ok "removed normalizer script"
+  launchctl unload "$WATCHDOG_PLIST" >/dev/null 2>&1 || true
+  rm -f "$API_PLIST" "$NORM_PLIST" "$WATCHDOG_PLIST" && ok "removed launchd services"
+  rm -f "$NORMALIZER" "$WATCHDOG" && ok "removed normalizer + watchdog scripts"
+  rm -f /tmp/com.copilot-api-watchdog.log /tmp/com.copilot-api-watchdog.notified \
+        /tmp/com.copilot-api-watchdog.out /tmp/com.copilot-api-watchdog.err 2>/dev/null || true
   rmdir "$KIT_DIR" >/dev/null 2>&1 || true
 
   if [ -f "$SETTINGS" ]; then
