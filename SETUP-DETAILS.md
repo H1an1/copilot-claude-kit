@@ -8,6 +8,9 @@ no visible window, no manual start, survives reboot.
 Claude Code ──►  model-id normalizer @ :4142  ──►  copilot-api @ :4141  ──►  GitHub Copilot
   (the shell)     (launchd shim: fixes model         (launchd daemon:          (the brain)
                    ids + trailing-msg quirks)         Anthropic-compatible)
+                              ▲
+                   watchdog (launchd, every 90s): probes both ports, restarts
+                   whichever daemon is wedged — the auto-heal for sleep/reboot
 ```
 
 The glue is [`ericc-ch/copilot-api`](https://github.com/ericc-ch/copilot-api) — a reverse-engineered
@@ -578,9 +581,10 @@ working. A chat reply alone doesn't prove it; tool calls are where these proxies
 | Check the chain end-to-end | `curl http://localhost:4142/v1/models` (goes through the shim to copilot-api) |
 | Check copilot-api directly | `curl http://localhost:4141/v1/models` |
 | View logs | copilot-api: `tail -f /tmp/copilot-api.log` / `cat /tmp/copilot-api.err` · normalizer: `tail -f /tmp/copilot-api-normalize.err` |
+| See when the watchdog healed something | `tail -f /tmp/com.copilot-api-watchdog.log` (only writes when it restarts a wedged daemon) |
 | Restart copilot-api | `launchctl kickstart -k gui/$(id -u)/com.copilot-api` |
 | Restart the normalizer | `launchctl kickstart -k gui/$(id -u)/com.copilot-api-normalize` (do this after editing the script) |
-| Stop everything | `launchctl unload ~/Library/LaunchAgents/com.copilot-api.plist ~/Library/LaunchAgents/com.copilot-api-normalize.plist` |
+| Stop everything | `launchctl unload ~/Library/LaunchAgents/com.copilot-api.plist ~/Library/LaunchAgents/com.copilot-api-normalize.plist ~/Library/LaunchAgents/com.copilot-api-watchdog.plist` |
 | Re-auth (token expired) | `copilot-api auth`, then restart copilot-api |
 | Update the proxy | `npm i -g copilot-api@latest`, then restart copilot-api |
 
@@ -589,10 +593,12 @@ working. A chat reply alone doesn't prove it; tool calls are where these proxies
 ## Keeping it from breaking again
 
 This chain has **three independently-moving parts**: Claude Code (auto-updates itself), copilot-api (the
-proxy), and Copilot's model catalog (ids get renamed/retired). Two pieces of this setup already absorb the
+proxy), and Copilot's model catalog (ids get renamed/retired). Three pieces of this setup absorb the
 churn: the **Step 6 normalizer** handles model-id drift (spelling, retired ids, `[1m]` variants,
-trailing-message quirks), and the **Step 7 `settings.json` redirect** applies in every launch context so
-there's no "wrapper didn't load" gap. Once both are in place you're largely covered. The rest is hardening:
+trailing-message quirks), the **Step 7 `settings.json` redirect** applies in every launch context so
+there's no "wrapper didn't load" gap, and the **watchdog** heals a daemon that wedged after sleep/wake or a
+network blip (the failure `launchctl`'s own `KeepAlive` can't see, because the process is still alive — it's
+the socket that died). Once all three are in place you're largely covered. The rest is hardening:
 
 **1. (Optional) Resolve the model id at launch with a shell wrapper.**
 The normalizer already prevents id-drift `400`s, so this is purely a convenience — it lets the shell pick

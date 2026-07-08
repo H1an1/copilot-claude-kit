@@ -31,6 +31,8 @@ That's it.
 Claude Code ──►  normalizer @ :4142  ──►  copilot-api @ :4141  ──►  GitHub Copilot
  (the shell)     (fixes model ids,         (Anthropic-compatible        (the brain)
                   hides bad variants)       Copilot proxy)
+                        ▲
+                  watchdog (every 90s: probes both ports, restarts a wedged one)
 ```
 
 The installer:
@@ -44,10 +46,13 @@ The installer:
    never hit `400 model_not_supported`.
 3. Runs both as always-on background services (launchd: start on login,
    auto-restart).
-4. Points Claude Code at the proxy via `~/.claude/settings.json` — which applies
+4. Adds a **watchdog** that probes both ports every 90s and restarts a wedged
+   daemon — so a sleep/wake or network blip can't leave you re-running the
+   installer to get `claude` working again.
+5. Points Claude Code at the proxy via `~/.claude/settings.json` — which applies
    to **every** way Claude launches (terminal, IDE, Claude Desktop's Cowork mode,
    subagents), not just a shell alias.
-5. Verifies the whole chain end-to-end before declaring success.
+6. Verifies the whole chain end-to-end before declaring success.
 
 ## Codex (optional — gpt-5.x via Copilot)
 
@@ -96,10 +101,10 @@ bash install.sh --uninstall   # remove everything it created (clean revert)
 bash install.sh               # re-run anytime to repair; it's idempotent
 ```
 
-`--uninstall` removes the services, the normalizer, and the keys it added to
-`settings.json` (backing the file up first). It leaves the `copilot-api` npm
-package and your Copilot token in place; it prints the two commands to remove
-those if you want a full wipe.
+`--uninstall` removes the services, the normalizer and watchdog scripts, and the
+keys it added to `settings.json` (backing the file up first). It leaves the
+`copilot-api` npm package and your Copilot token in place; it prints the two
+commands to remove those if you want a full wipe.
 
 ## Requirements
 
