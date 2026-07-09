@@ -222,6 +222,14 @@ function normalize(model) {
   if (supported.has(base)) return base;
   const dotted = base.replace(/^claude-(opus|sonnet|haiku)-(\d+)-(\d+)/, "claude-$1-$2.$3");
   if (supported.has(dotted)) return dotted;
+  // If dash->dot rewriting actually changed the id, the input was a dash-form
+  // claude id (e.g. claude-opus-4-8) and `dotted` is the canonical dot-form
+  // Copilot serves (claude-opus-4.8). Return it UNCONDITIONALLY — even when the
+  // `supported` set hasn't loaded yet (cold start, or :4141 briefly unreachable
+  // during a network blip). Without this, an empty `supported` falls through to
+  // the fallbacks below, which return `base` (the dash form) and 400 with
+  // model_not_supported. On a flaky link this was ~10% of rewrites.
+  if (dotted !== base) return dotted;
   const low = base.toLowerCase();
   if (low.includes("haiku")) return defaultHaiku() || defaultOpus() || base;
   if (low.includes("sonnet")) return defaultSonnet() || defaultOpus() || base;
