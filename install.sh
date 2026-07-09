@@ -191,6 +191,19 @@ function modelCeiling(id) {
   return 32000;
 }
 
+// Copilot rejects `thinking` / `reasoning_effort` for models that don't support
+// reasoning effort — notably the haiku family (small/fast). This matters here
+// because patch_copilot_api() translates `thinking:{enabled}` into
+// reasoning_effort:"high" for ALL models, and ANTHROPIC_SMALL_FAST_MODEL is
+// typically a haiku: background tasks then send opus-shaped effort to a haiku,
+// which 400s with invalid_reasoning_effort. So after the id is settled, drop
+// effort fields for models that can't take them. Opus/sonnet keep thinking.
+function supportsEffort(id) {
+  if (typeof id !== "string") return true;
+  if (/haiku/i.test(id)) return false;
+  return true;
+}
+
 // Claude Desktop only shows the effort selector for models whose id matches
 // Anthropic's canonical dash+date shape (e.g. claude-opus-4-1-20250805). Copilot
 // serves dot-form ids (claude-opus-4.8). So in the /v1/models listing we present
@@ -322,6 +335,21 @@ const server = http.createServer((req, res) => {
             changed = true;
           }
         }
+        // Drop reasoning-effort fields for models that can't accept them (haiku).
+        // Without this, rewriting an opus request down to the small haiku model
+        // leaves a `thinking`/`reasoning_effort` that haiku rejects with 400.
+        if (!supportsEffort(j.model)) {
+          if (j.thinking !== undefined) {
+            console.error(`[normalize] dropped thinking for ${j.model} (no effort support)`);
+            delete j.thinking;
+            changed = true;
+          }
+          if (j.reasoning_effort !== undefined) {
+            console.error(`[normalize] dropped reasoning_effort for ${j.model} (no effort support)`);
+            delete j.reasoning_effort;
+            changed = true;
+          }
+        }
         // Maximize the output budget so tool_use arguments can never get cut
         // off mid-stream. A starved budget truncates a long tool call, leaving
         // an unclosed input_json_delta -> the harness leaks <invoke> as text or
@@ -419,6 +447,20 @@ log()   { printf '%s %s\n' "$(stamp)" "$*" >> "$LOG"; }
 check() { curl -fsS -m 5 "http://localhost:$1/v1/models" >/dev/null 2>&1; }
 kick()  { launchctl kickstart -k "gui/$UID_N/$1" >/dev/null 2>&1; }
 
+# Probe a port up to 5 times with increasing backoff; succeed the moment it
+# answers. copilot-api can take 15-25s to become ready again after a kickstart,
+# so a single short sleep followed by a verdict misreads a slow-but-fine restart
+# as "token expired" and fires a bogus re-auth notification. Retrying with
+# backoff gives the restart room to finish before we conclude anything.
+check_retry() {  # $1=port ; ~25s total across 5 tries (3+4+5+6+7)
+  local port="$1"
+  for w in 3 4 5 6 7; do
+    check "$port" && return 0
+    sleep "$w"
+  done
+  check "$port"
+}
+
 notify_reauth() {
   local now last=0
   now="$(date +%s)"
@@ -433,19 +475,23 @@ healed=0
 
 if ! check "$API_PORT"; then
   log ":$API_PORT ($API_LABEL) not answering -> kickstart -k"
-  kick "$API_LABEL"; healed=1; sleep 5
+  kick "$API_LABEL"; healed=1
+  check_retry "$API_PORT" >/dev/null 2>&1   # wait out the restart before judging
 fi
 
 # Probed after :4141 because the normalizer proxies to it; if upstream was down,
 # giving it a moment first avoids a needless restart.
 if ! check "$NORM_PORT"; then
   log ":$NORM_PORT ($NORM_LABEL) not answering -> kickstart -k"
-  kick "$NORM_LABEL"; healed=1; sleep 3
+  kick "$NORM_LABEL"; healed=1
+  check_retry "$NORM_PORT" >/dev/null 2>&1
 fi
 
-# Second look: distinguish "wedged process" (healed) from "token expired".
-if ! check "$API_PORT"; then
-  log ":$API_PORT STILL down after kickstart — GitHub token likely expired; run 'copilot-api auth'"
+# Second look: only NOW, after giving restarts real time to finish, do we decide.
+# A still-dead :4141 here means kickstart couldn't revive it — the token has most
+# likely expired, which no restart can fix. That's the only case worth a human.
+if ! check_retry "$API_PORT"; then
+  log ":$API_PORT STILL down after kickstart + retries — GitHub token likely expired; run 'copilot-api auth'"
   notify_reauth
 elif [ "$healed" -eq 1 ]; then
   log "recovered: :$API_PORT and :$NORM_PORT answering again"
