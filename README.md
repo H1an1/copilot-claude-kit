@@ -32,7 +32,8 @@ Claude Code ──►  normalizer @ :4142  ──►  copilot-api @ :4141  ─�
  (the shell)     (fixes model ids,         (Anthropic-compatible        (the brain)
                   hides bad variants)       Copilot proxy)
                         ▲
-                  watchdog (every 90s: probes both ports, restarts a wedged one)
+            watchdog (every 90s: real 1-token completion through the chain;
+                      triages offline vs wedged vs dead auth)
 ```
 
 The installer:
@@ -46,13 +47,23 @@ The installer:
    never hit `400 model_not_supported`.
 3. Runs both as always-on background services (launchd: start on login,
    auto-restart).
-4. Adds a **watchdog** that probes both ports every 90s and restarts a wedged
-   daemon — so a sleep/wake or network blip can't leave you re-running the
-   installer to get `claude` working again.
-5. Points Claude Code at the proxy via `~/.claude/settings.json` — which applies
+4. Adds a **watchdog** that every 90s sends a real 1-token completion through
+   the whole chain — not a `GET /v1/models`, which copilot-api serves from a
+   cache that never expires and so answers `200` long after the token has died.
+   If that completion fails it first asks whether the machine is even online:
+   offline means wait (it heals itself on reconnect), online means restart the
+   wedged daemon, and only a still-broken chain on a working network gets you a
+   "re-auth" notification. So a sleep/wake or VPN drop can't leave you
+   re-running the installer to get `claude` working again.
+5. Patches copilot-api's **token-refresh crash loop**. Upstream re-throws inside
+   an async `setInterval`; on Node 24 that unhandled rejection kills the
+   process. Lose the network at the wrong moment (~every 25 min) and the daemon
+   dies, launchd restarts it into the same dead network, and it dies again —
+   indistinguishable from an expired token. Now it backs off and retries.
+6. Points Claude Code at the proxy via `~/.claude/settings.json` — which applies
    to **every** way Claude launches (terminal, IDE, Claude Desktop's Cowork mode,
    subagents), not just a shell alias.
-6. Verifies the whole chain end-to-end before declaring success.
+7. Verifies the whole chain end-to-end before declaring success.
 
 ## Codex (optional — gpt-5.x via Copilot)
 
@@ -124,11 +135,34 @@ accepting that risk knowingly — proceed only if that's fine for your context.
 
 ## Troubleshooting
 
-Run the doctor first — it pinpoints what's wrong:
+**First: you probably don't need to do anything.** The watchdog runs every 90s
+and self-heals a wedged daemon; a VPN drop or sleep/wake resolves on its own
+once the network is back. Give it ~2 minutes before intervening. Re-running the
+installer is *not* the fix for a transient outage — it never was, it just took
+long enough that the watchdog healed things in the meantime.
+
+If it's still broken, run the doctor — it pinpoints what's wrong:
 
 ```sh
 bash install.sh --verify
 ```
+
+Escalate in this order:
+
+1. **Wait ~2 min.** Watchdog territory. Check what it decided:
+   `tail /tmp/com.copilot-api-watchdog.log`. If it says *"waiting for the
+   network"*, that's the whole answer — reconnect and it recovers.
+2. **Force a restart now** if you don't want to wait:
+   `launchctl kickstart -k gui/$(id -u)/com.copilot-api` (and
+   `com.copilot-api-normalize`).
+3. **Re-auth**, but only if you got the "copilot-api needs re-auth"
+   notification, or the log says the token likely expired: `copilot-api auth`.
+   A restart can't fix a dead token, and nothing else can fake this symptom now
+   that offline is triaged separately.
+4. **Re-run the installer** only after a macOS upgrade, or if the launchd
+   plists are gone. It's idempotent and safe — just rarely the actual answer.
+
+Specific symptoms:
 
 - **It says "not authorized to Copilot"** → re-run `bash install.sh` and complete
   the browser step.
@@ -141,7 +175,8 @@ bash install.sh --verify
   restart the app (Claude Desktop: `Cmd+Q` and reopen). The model picker and effort
   control become yours again — the normalizer keeps whatever you pick valid.
 - **"Node.js not found"** → install Node (`brew install node`) and re-run.
-- **Token expired (401 later on)** → re-run `bash install.sh` to re-authorize.
+- **Token expired (401 later on)** → `copilot-api auth`. Only a genuinely expired
+  token needs this; see the ladder above before assuming that's what it is.
 
 For the full mechanism, design rationale, and a manual step-by-step (no script),
 see [`SETUP-DETAILS.md`](./SETUP-DETAILS.md).

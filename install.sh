@@ -170,9 +170,14 @@ function refreshModels() {
   });
 }
 
+// Prefer what the live model list advertises. But when `supported` is empty —
+// cold start, or :4141 unreachable during a network blip — an unfiltered
+// preference list is still far better than falling through to the caller's
+// unmapped id, which is a dash-form Copilot always 400s on. So in that case
+// take the first preference: it is a real dot-form id Copilot serves.
 function pick(prefs) {
   for (const p of prefs) if (supported.has(p)) return p;
-  return null;
+  return supported.size === 0 ? prefs[0] : null;
 }
 const defaultOpus = () => pick(["claude-opus-4.8", "claude-opus-4.7", "claude-opus-4.6", "claude-opus-4.5"]);
 const defaultSonnet = () => pick(["claude-sonnet-4.6", "claude-sonnet-4.5"]);
@@ -429,14 +434,21 @@ write_watchdog() {
 #
 # copilot-api watchdog
 # --------------------
-# Probes the exit ports (:4141 copilot-api, :4142 normalizer). If one is wedged
-# — process alive but socket dead, the failure launchd's KeepAlive can't see —
-# kickstart -k rebuilds it. This is what a manual installer re-run does for you,
-# minus the parts that never needed doing. It does NOT touch authentication.
+# Health is decided by a REAL completion through the whole chain
+# (POST :4142/v1/messages -> normalizer -> copilot-api -> Copilot), not by
+# GET /v1/models. That endpoint is served from copilot-api's in-memory cache
+# (`if (!state.models) await cacheModels()`), which never expires — so it keeps
+# answering 200 long after the Copilot token has died or the network has gone.
+# Probing it means the watchdog reports "healthy" while every user request 401s.
+# A 1-token haiku completion costs ~nothing and sees what the user sees.
 #
-# If :4141 is STILL down after a kickstart, the GitHub token has most likely
-# expired (kickstart can't fix that) — logged + a throttled macOS notification
-# tells you to run `copilot-api auth` once. That's the only human-needed case.
+# Failure is then triaged instead of guessed:
+#   * no network        -> stay quiet, change nothing; it will heal itself
+#   * network, wedged   -> kickstart -k (what a manual installer re-run does)
+#   * network, still bad-> auth is genuinely dead; throttled notification
+# The old script skipped this triage and blamed the token for every failure, so
+# an offline laptop got told to run `copilot-api auth` — which cannot help, and
+# sends people back to re-running the installer for a problem it never fixes.
 #
 # Runs as a periodic launchd job (StartInterval), not a resident process.
 set -uo pipefail
@@ -449,24 +461,48 @@ API_PORT=4141                 # copilot-api
 NORM_PORT=4142                # normalizer
 API_LABEL="com.copilot-api"
 NORM_LABEL="com.copilot-api-normalize"
+LOG_MAX=200000                # bytes; trimmed to the last half when exceeded
 
 stamp() { date '+%Y-%m-%d %H:%M:%S'; }
 log()   { printf '%s %s\n' "$(stamp)" "$*" >> "$LOG"; }
-check() { curl -fsS -m 5 "http://localhost:$1/v1/models" >/dev/null 2>&1; }
-kick()  { launchctl kickstart -k "gui/$UID_N/$1" >/dev/null 2>&1; }
 
-# Probe a port up to 5 times with increasing backoff; succeed the moment it
-# answers. copilot-api can take 15-25s to become ready again after a kickstart,
-# so a single short sleep followed by a verdict misreads a slow-but-fine restart
-# as "token expired" and fires a bogus re-auth notification. Retrying with
-# backoff gives the restart room to finish before we conclude anything.
-check_retry() {  # $1=port ; ~25s total across 5 tries (3+4+5+6+7)
-  local port="$1"
+# Socket liveness only — says the port is bound, NOT that requests work.
+alive() { curl -fsS -m 5 "http://localhost:$1/v1/models" >/dev/null 2>&1; }
+
+# End-to-end health: the smallest real completion, through the normalizer, using
+# a dash-form id so id-rewriting is exercised too. This is the actual verdict.
+works() {
+  local out
+  out="$(curl -fsS -m 25 "http://localhost:$NORM_PORT/v1/messages" \
+    -H 'content-type: application/json' -H 'x-api-key: dummy' \
+    -H 'anthropic-version: 2023-06-01' \
+    -d '{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"ping"}]}' \
+    2>/dev/null)" || return 1
+  case "$out" in *'"type":"message"'*) return 0 ;; *) return 1 ;; esac
+}
+
+# Is the machine actually online? Without this, a closed lid / dropped VPN is
+# indistinguishable from an expired token, and we cry wolf.
+net_ok() { curl -fsS -m 8 -o /dev/null https://api.github.com/ >/dev/null 2>&1; }
+
+kick() { launchctl kickstart -k "gui/$UID_N/$1" >/dev/null 2>&1; }
+
+# copilot-api needs 15-25s to serve again after a kickstart. Judging earlier
+# misreads a slow-but-fine restart as a dead token.
+works_retry() {  # ~25s across 5 tries (3+4+5+6+7)
+  local w
   for w in 3 4 5 6 7; do
-    check "$port" && return 0
+    works && return 0
     sleep "$w"
   done
-  check "$port"
+  works
+}
+
+trim_log() {
+  [ -f "$LOG" ] || return 0
+  local size; size="$(wc -c < "$LOG" 2>/dev/null || echo 0)"
+  [ "$size" -gt "$LOG_MAX" ] || return 0
+  tail -c $((LOG_MAX / 2)) "$LOG" > "$LOG.tmp" 2>/dev/null && mv "$LOG.tmp" "$LOG"
 }
 
 notify_reauth() {
@@ -479,31 +515,50 @@ notify_reauth() {
   fi
 }
 
-healed=0
+trim_log
 
-if ! check "$API_PORT"; then
-  log ":$API_PORT ($API_LABEL) not answering -> kickstart -k"
-  kick "$API_LABEL"; healed=1
-  check_retry "$API_PORT" >/dev/null 2>&1   # wait out the restart before judging
-fi
-
-# Probed after :4141 because the normalizer proxies to it; if upstream was down,
-# giving it a moment first avoids a needless restart.
-if ! check "$NORM_PORT"; then
-  log ":$NORM_PORT ($NORM_LABEL) not answering -> kickstart -k"
-  kick "$NORM_LABEL"; healed=1
-  check_retry "$NORM_PORT" >/dev/null 2>&1
-fi
-
-# Second look: only NOW, after giving restarts real time to finish, do we decide.
-# A still-dead :4141 here means kickstart couldn't revive it — the token has most
-# likely expired, which no restart can fix. That's the only case worth a human.
-if ! check_retry "$API_PORT"; then
-  log ":$API_PORT STILL down after kickstart + retries — GitHub token likely expired; run 'copilot-api auth'"
-  notify_reauth
-elif [ "$healed" -eq 1 ]; then
-  log "recovered: :$API_PORT and :$NORM_PORT answering again"
+# Healthy: nothing to do. This is the overwhelmingly common path, and it costs
+# one 1-token completion.
+if works; then
   rm -f "$NOTIFY_STAMP" 2>/dev/null || true
+  exit 0
+fi
+
+# Offline: not our problem to fix, and restarting into a dead network only
+# burns launchd backoff. Say nothing, touch nothing — it heals on reconnect
+# (the normalizer re-fetches the model list on any request older than 30s).
+if ! net_ok; then
+  log "chain unhealthy but the machine is offline — waiting for the network, no action"
+  exit 0
+fi
+
+# Online but broken -> restart whichever side isn't even holding its socket;
+# if both are bound, the wedge is internal, so rebuild both.
+if ! alive "$API_PORT"; then
+  log ":$API_PORT ($API_LABEL) socket down -> kickstart -k"
+  kick "$API_LABEL"
+elif ! alive "$NORM_PORT"; then
+  log ":$NORM_PORT ($NORM_LABEL) socket down -> kickstart -k"
+  kick "$NORM_LABEL"
+else
+  log "both ports answer but completions fail -> kickstart -k both"
+  kick "$API_LABEL"; kick "$NORM_LABEL"
+fi
+
+# Only now, after restarts have had real time to finish, do we decide.
+if works_retry; then
+  log "recovered: end-to-end completion succeeds again"
+  rm -f "$NOTIFY_STAMP" 2>/dev/null || true
+  exit 0
+fi
+
+# Still broken with a working network and a fresh process: authentication is the
+# remaining explanation, and no restart can fix that. The one human-needed case.
+if net_ok; then
+  log "still failing after restart, network is up — GitHub token likely expired; run 'copilot-api auth'"
+  notify_reauth
+else
+  log "still failing, but the network dropped again mid-check — treating as offline, no action"
 fi
 
 exit 0
@@ -549,6 +604,7 @@ ensure_copilot_api() {
     ok "installed copilot-api: $COPILOT_API_BIN"
   fi
   patch_copilot_api
+  patch_token_refresh
 }
 
 # copilot-api collapses Claude extended-thinking blocks to plain text and drops
@@ -565,6 +621,43 @@ patch_copilot_api() {
     s=s.replace("content: [...allTextBlocks, ...allToolUseBlocks],","content: [...(response.choices[0]?.message?.reasoning_text?[{type:\"thinking\",thinking:response.choices[0].message.reasoning_text,signature:\"\"}]:[]), ...allTextBlocks, ...allToolUseBlocks],");
     fs.writeFileSync(f,s);
   ' "$m" 2>/dev/null && ok "patched copilot-api for extended thinking" || warn "thinking patch skipped"
+}
+
+# copilot-api refreshes its Copilot token every ~25 min. Upstream's catch block
+# re-throws inside an async setInterval callback — an unhandled rejection, which
+# Node 24 turns into process exit. If the network happens to be down at that
+# moment (VPN drop, closed lid) the daemon dies, launchd restarts it into the
+# same dead network, and it dies again: a crash loop that looks exactly like an
+# expired token, so the old watchdog told people to re-auth and they ended up
+# re-running this installer for a problem it never fixed. Replace the re-throw
+# with capped exponential backoff: a transient outage costs a retry, not the
+# process. Idempotent; re-applies after every reinstall.
+patch_token_refresh() {
+  local m; m="$(npm root -g 2>/dev/null)/copilot-api/dist/main.js"
+  [ -f "$m" ] || return 0
+  local js; js="$(mktemp -t cck-refresh)"
+  cat > "$js" <<'REFRESH_PATCH_EOF'
+const f = process.argv[2], fs = require("fs");
+let s = fs.readFileSync(f, "utf8");
+if (s.includes("__cck_refresh_retry")) process.exit(0);
+const re = /consola\.error\("Failed to refresh Copilot token:", error\);\s*throw error;/;
+if (!re.test(s)) process.exit(1);
+s = s.replace(re, [
+  'consola.error("Failed to refresh Copilot token (__cck_refresh_retry):", error);',
+  'globalThis.__cck_refresh_retry = (globalThis.__cck_refresh_retry || 0) + 1;',
+  'const __d = Math.min(300, 5 * Math.pow(2, Math.min(globalThis.__cck_refresh_retry - 1, 6))) * 1e3;',
+  'setTimeout(async () => { try { const r = await getCopilotToken(); state.copilotToken = r.token; ',
+  'globalThis.__cck_refresh_retry = 0; consola.info("Copilot token recovered after retry"); } ',
+  'catch (e) { consola.error("Copilot token retry failed:", e); } }, __d).unref?.();'
+].join(""));
+fs.writeFileSync(f, s);
+REFRESH_PATCH_EOF
+  if node "$js" "$m" 2>/dev/null; then
+    ok "patched copilot-api token refresh (backoff, no crash)"
+  else
+    warn "token-refresh patch skipped"
+  fi
+  rm -f "$js"
 }
 
 write_plist() {  # $1=path $2=label $3..=program args
@@ -655,6 +748,24 @@ is_authed() {  # daemon up AND /v1/models returns a model list (not 401)
   out="$(curl -fsS -m 3 "http://localhost:${API_PORT}/v1/models" 2>/dev/null)" || return 1
   case "$out" in *'"id"'*) return 0 ;; *) return 1 ;; esac
 }
+
+# A freshly (re)started copilot-api binds its port well before it has fetched the
+# model catalog — 15-25s can pass between the two. Asking is_authed once inside
+# that window says "not authorized" about a machine that is perfectly authorized,
+# which sends an already-working install into the device-code flow and then out
+# through `exit 1`. Give the daemon room to finish before drawing a conclusion.
+is_authed_retry() {  # ~30s across 6 tries (2+3+4+6+7+8)
+  local w
+  for w in 2 3 4 6 7 8; do
+    is_authed && return 0
+    sleep "$w"
+  done
+  is_authed
+}
+
+# Distinguishes "no network" from "no token" — without it, an offline machine is
+# told to re-authorize, which cannot possibly help.
+net_ok() { curl -fsS -m 8 -o /dev/null https://api.github.com/ >/dev/null 2>&1; }
 
 service_loaded() {  # $1=label ; true if launchd knows this service (no pipe -> no SIGPIPE/pipefail trap)
   launchctl list "$1" >/dev/null 2>&1
@@ -761,7 +872,7 @@ do_install() {
     warn "copilot-api is up but not returning models yet — likely needs GitHub authorization"
   fi
 
-  if ! is_authed; then
+  if ! is_authed_retry; then
     step "GitHub authorization (one-time, needs you)"
     say "A device code will appear below. Open the URL, enter the code, approve Copilot access."
     say "${B}This is the only manual step.${X}"
@@ -781,9 +892,14 @@ do_install() {
     wait_for_port "$API_PORT" 20 || true
   fi
 
-  if ! is_authed; then
-    err "Still not authorized to Copilot. Re-run 'bash install.sh' after finishing the browser step."
-    err "Check logs: /tmp/com.copilot-api.err"
+  if ! is_authed_retry; then
+    if ! net_ok; then
+      err "Can't reach github.com — this looks like a network/VPN problem, not an auth one."
+      err "Reconnect and re-run. Nothing else needs doing; the watchdog will pick it up on its own."
+    else
+      err "Still not authorized to Copilot. Re-run 'bash install.sh' after finishing the browser step."
+      err "Check logs: /tmp/com.copilot-api.err"
+    fi
     exit 1
   fi
   ok "authorized to Copilot — models are available"
@@ -831,7 +947,9 @@ do_verify() {
   if curl -fsS -m 3 "http://localhost:$API_PORT/v1/models" >/dev/null 2>&1; then ok ":$API_PORT copilot-api responding"; else err ":$API_PORT copilot-api not responding"; fail=1; fi
   if curl -fsS -m 3 "http://localhost:$NORM_PORT/v1/models" >/dev/null 2>&1; then ok ":$NORM_PORT normalizer responding"; else err ":$NORM_PORT normalizer not responding"; fail=1; fi
 
-  if is_authed; then ok "authorized to Copilot (models listed)"; else err "not authorized to Copilot (run: bash install.sh)"; fail=1; fi
+  if is_authed_retry; then ok "authorized to Copilot (models listed)"
+  elif ! net_ok; then warn "can't reach github.com — network/VPN issue, not auth; reconnect and re-check"; fail=1
+  else err "not authorized to Copilot (run: copilot-api auth)"; fail=1; fi
 
   if [ -f "$SETTINGS" ] && grep -q "localhost:$NORM_PORT" "$SETTINGS" 2>/dev/null; then
     ok "settings.json points at :$NORM_PORT"

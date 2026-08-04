@@ -9,8 +9,8 @@ Claude Code ──►  model-id normalizer @ :4142  ──►  copilot-api @ :41
   (the shell)     (launchd shim: fixes model         (launchd daemon:          (the brain)
                    ids + trailing-msg quirks)         Anthropic-compatible)
                               ▲
-                   watchdog (launchd, every 90s): probes both ports, restarts
-                   whichever daemon is wedged — the auto-heal for sleep/reboot
+                   watchdog (launchd, every 90s): sends a real 1-token completion
+                   through the chain, then triages offline vs wedged vs dead auth
 ```
 
 The glue is [`ericc-ch/copilot-api`](https://github.com/ericc-ch/copilot-api) — a reverse-engineered
@@ -581,7 +581,7 @@ working. A chat reply alone doesn't prove it; tool calls are where these proxies
 | Check the chain end-to-end | `curl http://localhost:4142/v1/models` (goes through the shim to copilot-api) |
 | Check copilot-api directly | `curl http://localhost:4141/v1/models` |
 | View logs | copilot-api: `tail -f /tmp/copilot-api.log` / `cat /tmp/copilot-api.err` · normalizer: `tail -f /tmp/copilot-api-normalize.err` |
-| See when the watchdog healed something | `tail -f /tmp/com.copilot-api-watchdog.log` (only writes when it restarts a wedged daemon) |
+| See what the watchdog decided | `tail -f /tmp/com.copilot-api-watchdog.log` (silent while healthy; logs offline waits, restarts, and recoveries) |
 | Restart copilot-api | `launchctl kickstart -k gui/$(id -u)/com.copilot-api` |
 | Restart the normalizer | `launchctl kickstart -k gui/$(id -u)/com.copilot-api-normalize` (do this after editing the script) |
 | Stop everything | `launchctl unload ~/Library/LaunchAgents/com.copilot-api.plist ~/Library/LaunchAgents/com.copilot-api-normalize.plist ~/Library/LaunchAgents/com.copilot-api-watchdog.plist` |
@@ -598,7 +598,29 @@ churn: the **Step 6 normalizer** handles model-id drift (spelling, retired ids, 
 trailing-message quirks), the **Step 7 `settings.json` redirect** applies in every launch context so
 there's no "wrapper didn't load" gap, and the **watchdog** heals a daemon that wedged after sleep/wake or a
 network blip (the failure `launchctl`'s own `KeepAlive` can't see, because the process is still alive — it's
-the socket that died). Once all three are in place you're largely covered. The rest is hardening:
+the socket that died).
+
+The watchdog's health check is a **real 1-token completion through `:4142`**, not `GET /v1/models`. That
+distinction matters more than it looks: copilot-api serves the model list from an in-memory cache
+(`if (!state.models) await cacheModels()`) that is populated once and **never invalidated**, so `:4141/v1/models`
+keeps returning `200` long after the Copilot token has expired or the network has gone. A watchdog probing it
+reports "healthy" while every actual user request `401`s — which is precisely the state people escape by
+re-running the installer, concluding the installer was the fix. It wasn't; it just took long enough.
+
+When the completion fails, the watchdog **triages instead of guessing**: it checks `api.github.com` first. No
+network means do nothing (restarting into a dead network only burns launchd's backoff, and the normalizer
+re-fetches the model list on any request older than 30s, so reconnecting heals it). Network but a dead socket
+means `kickstart -k`. Network, live sockets, and still-failing completions after a restart is the only state
+that genuinely implicates authentication — and only that state raises the "run `copilot-api auth`" notification.
+
+One more failure mode lives upstream: copilot-api refreshes its Copilot token on a `setInterval` whose `catch`
+block **re-throws**. In an async callback that's an unhandled rejection, and Node 24 exits the process on
+those. Lose the network during a refresh (~every 25 min) and the daemon dies, launchd restarts it into the
+same dead network, and it dies again — a crash loop wearing the costume of an expired token. The installer
+patches that `throw` into capped exponential backoff (5s → 300s), so a transient outage costs a retry rather
+than the process.
+
+Once all of this is in place you're largely covered. The rest is hardening:
 
 **1. (Optional) Resolve the model id at launch with a shell wrapper.**
 The normalizer already prevents id-drift `400`s, so this is purely a convenience — it lets the shell pick
