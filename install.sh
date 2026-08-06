@@ -7,10 +7,12 @@
 # automatically so it "just works".
 #
 # Usage:
-#   bash install.sh              # install / repair (idempotent)
-#   bash install.sh --with-codex # also set up OpenAI Codex on Copilot (gpt-5.x)
-#   bash install.sh --verify     # health-check an existing install (doctor)
-#   bash install.sh --uninstall  # remove everything this script created
+#   bash install.sh                     # install / repair (idempotent)
+#   bash install.sh --with-codex        # add a Codex CLI profile
+#   bash install.sh --with-codex-desktop # make Codex Desktop use Copilot
+#   bash install.sh --restore-codex-desktop # undo only the Desktop change
+#   bash install.sh --verify            # health-check an existing install
+#   bash install.sh --uninstall         # remove everything this script created
 #   bash install.sh --help
 #
 # One-liner:
@@ -52,11 +54,23 @@ API_PLIST="$LA_DIR/com.copilot-api.plist"
 NORM_PLIST="$LA_DIR/com.copilot-api-normalize.plist"
 WATCHDOG="$KIT_DIR/watchdog.sh"
 WATCHDOG_PLIST="$LA_DIR/com.copilot-api-watchdog.plist"
+WATCHDOG_MODE_FILE="$KIT_DIR/watchdog-mode"
 SETTINGS="$HOME/.claude/settings.json"
 API_PORT=4141
 NORM_PORT=4142
 WATCHDOG_INTERVAL=90
 GH_TOKEN_FILE="$HOME/.local/share/copilot-api/github_token"
+CODEX_DIR="$HOME/.codex"
+CODEX_CONFIG="$CODEX_DIR/config.toml"
+CODEX_CATALOG="$CODEX_DIR/copilot-models.json"
+CODEX_CATALOG_BACKUP="$CODEX_DIR/copilot-models.pre-copilot-claude-kit.json"
+CODEX_CATALOG_CREATED_MARKER="$CODEX_DIR/.copilot-models-created-by-copilot-claude-kit"
+CODEX_CONFIG_CREATED_MARKER="$CODEX_DIR/.config-created-by-copilot-claude-kit"
+CODEX_DESKTOP_MODEL="gpt-5.6-sol"
+CODEX_ROOT_BEGIN="# >>> copilot-claude-kit: Codex Desktop model >>>"
+CODEX_ROOT_END="# <<< copilot-claude-kit: Codex Desktop model <<<"
+CODEX_PROVIDER_BEGIN="# >>> copilot-claude-kit: Codex Desktop provider >>>"
+CODEX_PROVIDER_END="# <<< copilot-claude-kit: Codex Desktop provider <<<"
 
 # ===========================================================================
 #  model-normalizer.js  (embedded so users never copy-paste it)
@@ -434,13 +448,14 @@ write_watchdog() {
 #
 # copilot-api watchdog
 # --------------------
-# Health is decided by a REAL completion through the whole chain
-# (POST :4142/v1/messages -> normalizer -> copilot-api -> Copilot), not by
-# GET /v1/models. That endpoint is served from copilot-api's in-memory cache
+# Health is decided by a REAL completion through the configured client path:
+# Anthropic Messages for a Claude install, or OpenAI Responses for a Codex
+# install. It is not decided by GET /v1/models, which copilot-api serves from
+# an in-memory cache
 # (`if (!state.models) await cacheModels()`), which never expires — so it keeps
 # answering 200 long after the Copilot token has died or the network has gone.
 # Probing it means the watchdog reports "healthy" while every user request 401s.
-# A 1-token haiku completion costs ~nothing and sees what the user sees.
+# A tiny completion costs ~nothing and sees what the user sees.
 #
 # Failure is then triaged instead of guessed:
 #   * no network        -> stay quiet, change nothing; it will heal itself
@@ -461,6 +476,7 @@ API_PORT=4141                 # copilot-api
 NORM_PORT=4142                # normalizer
 API_LABEL="com.copilot-api"
 NORM_LABEL="com.copilot-api-normalize"
+MODE_FILE="$HOME/.copilot-api/watchdog-mode"
 LOG_MAX=200000                # bytes; trimmed to the last half when exceeded
 
 stamp() { date '+%Y-%m-%d %H:%M:%S'; }
@@ -469,9 +485,8 @@ log()   { printf '%s %s\n' "$(stamp)" "$*" >> "$LOG"; }
 # Socket liveness only — says the port is bound, NOT that requests work.
 alive() { curl -fsS -m 5 "http://localhost:$1/v1/models" >/dev/null 2>&1; }
 
-# End-to-end health: the smallest real completion, through the normalizer, using
-# a dash-form id so id-rewriting is exercised too. This is the actual verdict.
-works() {
+# End-to-end Claude health: use a dash-form id so rewriting is exercised too.
+works_claude() {
   local out
   out="$(curl -fsS -m 25 "http://localhost:$NORM_PORT/v1/messages" \
     -H 'content-type: application/json' -H 'x-api-key: dummy' \
@@ -479,6 +494,27 @@ works() {
     -d '{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"ping"}]}' \
     2>/dev/null)" || return 1
   case "$out" in *'"type":"message"'*) return 0 ;; *) return 1 ;; esac
+}
+
+# End-to-end Codex health: Responses is forwarded straight to Copilot by the
+# normalizer, exactly like Codex Desktop and CLI.
+works_codex_model() {
+  local model="$1" out
+  out="$(curl -fsS -m 25 "http://localhost:$NORM_PORT/v1/responses" \
+    -H 'content-type: application/json' \
+    -d "{\"model\":\"$model\",\"input\":\"reply with exactly one word: pong\",\"stream\":false}" \
+    2>/dev/null)" || return 1
+  case "$out" in *'"status":"completed"'*|*'"output"'*) return 0 ;; *) return 1 ;; esac
+}
+
+works_codex() {
+  works_codex_model "gpt-5.6-sol" || works_codex_model "gpt-5.5"
+}
+
+works() {
+  local mode="claude"
+  [ -f "$MODE_FILE" ] && mode="$(cat "$MODE_FILE" 2>/dev/null || echo claude)"
+  case "$mode" in codex) works_codex ;; *) works_claude ;; esac
 }
 
 # Is the machine actually online? Without this, a closed lid / dropped VPN is
@@ -810,9 +846,9 @@ smoke_test() {  # send a dash-form id through the normalizer; expect a real mess
   case "$out" in *'"type":"message"'*) return 0 ;; *) return 1 ;; esac
 }
 
-CODEX_PROFILE="$HOME/.codex/copilot.config.toml"
+CODEX_PROFILE="$CODEX_DIR/copilot.config.toml"
 write_codex_profile() {
-  mkdir -p "$HOME/.codex"
+  mkdir -p "$CODEX_DIR"
   [ -f "$CODEX_PROFILE" ] && cp "$CODEX_PROFILE" "$CODEX_PROFILE.bak"
   cat > "$CODEX_PROFILE" <<EOF
 # Written by copilot-claude-kit (bash install.sh --with-codex).
@@ -831,15 +867,253 @@ EOF
 }
 
 codex_smoke_test() {  # POST /v1/responses through the normalizer; expect a completed response
-  local out
+  local model="${1:-gpt-5.5}" out
   out="$(curl -fsS -m 40 "http://localhost:${NORM_PORT}/v1/responses" \
     -H 'content-type: application/json' \
-    -d '{"model":"gpt-5.5","input":"reply with exactly one word: pong","stream":false}' 2>/dev/null)" || return 1
+    -d "{\"model\":\"${model}\",\"input\":\"reply with exactly one word: pong\",\"stream\":false}" 2>/dev/null)" || return 1
   case "$out" in *'"status":"completed"'*|*'"output"'*) return 0 ;; *) return 1 ;; esac
 }
 
+backup_codex_file() {
+  local path="$1" stamp backup n=1
+  [ -f "$path" ] || return 0
+  stamp="$(date '+%Y%m%d-%H%M%S')"
+  backup="${path}.bak.${stamp}.$$"
+  while [ -e "$backup" ]; do
+    backup="${path}.bak.${stamp}.$$.$n"
+    n=$((n+1))
+  done
+  cp "$path" "$backup" || return 1
+  ok "backup: $backup"
+}
+
+prepare_codex_catalog_backup() {
+  mkdir -p "$CODEX_DIR"
+  if [ ! -e "$CODEX_CATALOG_BACKUP" ] && [ ! -e "$CODEX_CATALOG_CREATED_MARKER" ]; then
+    if [ -f "$CODEX_CATALOG" ]; then
+      cp "$CODEX_CATALOG" "$CODEX_CATALOG_BACKUP" || die "couldn't back up $CODEX_CATALOG"
+      ok "preserved existing model catalog: $CODEX_CATALOG_BACKUP"
+    else
+      : > "$CODEX_CATALOG_CREATED_MARKER"
+    fi
+  fi
+}
+
+write_codex_catalog() {
+  local tmp="${CODEX_CATALOG}.tmp.$$"
+  prepare_codex_catalog_backup
+  cat > "$tmp" <<'CATALOG_EOF'
+{
+  "models": [
+    {
+      "slug": "gpt-5.6-sol",
+      "display_name": "GPT-5.6 Sol (Copilot)",
+      "description": "GitHub Copilot through the local Responses proxy.",
+      "default_reasoning_level": "high",
+      "supported_reasoning_levels": [
+        { "effort": "low", "description": "Fast" },
+        { "effort": "medium", "description": "Balanced" },
+        { "effort": "high", "description": "Deep reasoning" },
+        { "effort": "xhigh", "description": "Extra deep reasoning" },
+        { "effort": "max", "description": "Maximum reasoning" }
+      ],
+      "shell_type": "shell_command",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 1,
+      "context_window": 272000,
+      "base_instructions": "You are Codex, a coding agent. Work carefully, use tools when needed, and complete the user's request.",
+      "support_verbosity": true,
+      "default_verbosity": "low",
+      "truncation_policy": { "mode": "tokens", "limit": 10000 },
+      "experimental_supported_tools": [],
+      "supports_parallel_tool_calls": true,
+      "supports_reasoning_summary_parameter": true,
+      "default_reasoning_summary": "none",
+      "apply_patch_tool_type": "freeform",
+      "web_search_tool_type": "text_and_image",
+      "input_modalities": ["text", "image"]
+    }
+  ]
+}
+CATALOG_EOF
+  mv "$tmp" "$CODEX_CATALOG" || die "couldn't write $CODEX_CATALOG"
+  ok "wrote Codex model catalog: $CODEX_CATALOG"
+}
+
+merge_codex_desktop_config() {
+  local node
+  node="${NODE_BIN:-$(find_node)}" || die "Node.js is required to merge Codex config safely"
+  mkdir -p "$CODEX_DIR"
+  if [ ! -f "$CODEX_CONFIG" ] && [ ! -e "$CODEX_CONFIG_CREATED_MARKER" ]; then
+    : > "$CODEX_CONFIG_CREATED_MARKER"
+  fi
+  backup_codex_file "$CODEX_CONFIG" || die "couldn't back up $CODEX_CONFIG"
+
+  "$node" - "$CODEX_CONFIG" "$CODEX_CATALOG" "$CODEX_DESKTOP_MODEL" "$NORM_PORT" \
+    "$CODEX_ROOT_BEGIN" "$CODEX_ROOT_END" "$CODEX_PROVIDER_BEGIN" "$CODEX_PROVIDER_END" <<'NODE_EOF'
+const fs = require("fs");
+const [
+  configPath, catalogPath, model, port,
+  rootBegin, rootEnd, providerBegin, providerEnd,
+] = process.argv.slice(2);
+const disabled = "# CCK-DISABLED ";
+
+let lines = fs.existsSync(configPath)
+  ? fs.readFileSync(configPath, "utf8").replace(/\r\n/g, "\n").split("\n")
+  : [];
+
+function stripManaged(input, begin, end) {
+  const out = [];
+  let skipping = false;
+  for (const line of input) {
+    if (!skipping && line === begin) { skipping = true; continue; }
+    if (skipping && line === end) { skipping = false; continue; }
+    if (!skipping) out.push(line);
+  }
+  return out;
+}
+
+// Make re-runs idempotent: first return the previous managed edit to its
+// original shape, then apply the current values.
+lines = stripManaged(lines, rootBegin, rootEnd);
+lines = stripManaged(lines, providerBegin, providerEnd);
+lines = lines.map((line) => line.startsWith(disabled) ? line.slice(disabled.length) : line);
+
+// Preserve, but temporarily disable, only the root keys Codex Desktop needs.
+let firstTable = lines.findIndex((line) => /^\s*\[/.test(line));
+if (firstTable < 0) firstTable = lines.length;
+const rootKey = /^\s*(model|model_provider|model_catalog_json|model_reasoning_effort)\s*=/;
+for (let i = 0; i < firstTable; i++) {
+  if (rootKey.test(lines[i])) lines[i] = disabled + lines[i];
+}
+
+// Preserve an existing copilot provider table verbatim. The managed provider is
+// appended at the end; restore simply removes ours and uncomments theirs.
+let inCopilotProvider = false;
+for (let i = 0; i < lines.length; i++) {
+  const line = lines[i];
+  if (/^\s*\[/.test(line)) {
+    inCopilotProvider =
+      /^\s*\[\s*model_providers\.(?:copilot|"copilot"|'copilot')(?:\s*\]|\.)/.test(line);
+  }
+  if (inCopilotProvider) lines[i] = disabled + line;
+}
+
+firstTable = lines.findIndex((line) => /^\s*\[/.test(line));
+if (firstTable < 0) firstTable = lines.length;
+const rootBlock = [
+  rootBegin,
+  `model = ${JSON.stringify(model)}`,
+  'model_provider = "copilot"',
+  `model_catalog_json = ${JSON.stringify(catalogPath)}`,
+  'model_reasoning_effort = "high"',
+  "",
+  rootEnd,
+];
+lines.splice(firstTable, 0, ...rootBlock);
+
+lines.push(
+  providerBegin,
+  "[model_providers.copilot]",
+  'name = "GitHub Copilot (local proxy)"',
+  `base_url = "http://127.0.0.1:${port}/v1"`,
+  'wire_api = "responses"',
+  "",
+  providerEnd
+);
+
+const tmp = configPath + ".tmp." + process.pid;
+fs.writeFileSync(tmp, lines.join("\n"));
+fs.renameSync(tmp, configPath);
+NODE_EOF
+  ok "merged Codex Desktop config: $CODEX_CONFIG"
+}
+
+restore_codex_desktop_config() {
+  local node changed=0
+  node="$(find_node)" || die "Node.js is required to restore Codex config safely"
+
+  if [ -f "$CODEX_CONFIG" ] && grep -qF "$CODEX_ROOT_BEGIN" "$CODEX_CONFIG" 2>/dev/null; then
+    backup_codex_file "$CODEX_CONFIG" || die "couldn't back up $CODEX_CONFIG"
+    "$node" - "$CODEX_CONFIG" "$CODEX_ROOT_BEGIN" "$CODEX_ROOT_END" \
+      "$CODEX_PROVIDER_BEGIN" "$CODEX_PROVIDER_END" <<'NODE_EOF'
+const fs = require("fs");
+const [configPath, rootBegin, rootEnd, providerBegin, providerEnd] = process.argv.slice(2);
+const disabled = "# CCK-DISABLED ";
+let lines = fs.readFileSync(configPath, "utf8").replace(/\r\n/g, "\n").split("\n");
+function stripManaged(input, begin, end) {
+  const out = [];
+  let skipping = false;
+  for (const line of input) {
+    if (!skipping && line === begin) { skipping = true; continue; }
+    if (skipping && line === end) { skipping = false; continue; }
+    if (!skipping) out.push(line);
+  }
+  return out;
+}
+lines = stripManaged(lines, rootBegin, rootEnd);
+lines = stripManaged(lines, providerBegin, providerEnd);
+lines = lines.map((line) => line.startsWith(disabled) ? line.slice(disabled.length) : line);
+let text = lines.join("\n");
+const tmp = configPath + ".tmp." + process.pid;
+fs.writeFileSync(tmp, text);
+fs.renameSync(tmp, configPath);
+NODE_EOF
+    changed=1
+    if [ -e "$CODEX_CONFIG_CREATED_MARKER" ] && ! grep -q '[^[:space:]]' "$CODEX_CONFIG"; then
+      rm -f "$CODEX_CONFIG"
+    fi
+    rm -f "$CODEX_CONFIG_CREATED_MARKER"
+    ok "restored previous Codex config"
+  fi
+
+  if [ -f "$CODEX_CATALOG_BACKUP" ]; then
+    mv "$CODEX_CATALOG_BACKUP" "$CODEX_CATALOG" || die "couldn't restore previous model catalog"
+    rm -f "$CODEX_CATALOG_CREATED_MARKER"
+    changed=1
+    ok "restored previous Codex model catalog"
+  elif [ -e "$CODEX_CATALOG_CREATED_MARKER" ]; then
+    rm -f "$CODEX_CATALOG" "$CODEX_CATALOG_CREATED_MARKER"
+    changed=1
+    ok "removed Codex model catalog created by this installer"
+  fi
+
+  [ "$changed" -eq 1 ] || warn "no managed Codex Desktop configuration found"
+}
+
+find_codex_binary() {
+  local candidate
+  for candidate in \
+    "/Applications/ChatGPT.app/Contents/Resources/codex" \
+    "/Applications/Codex.app/Contents/Resources/codex"
+  do
+    if [ -x "$candidate" ]; then printf '%s\n' "$candidate"; return 0; fi
+  done
+  command -v codex 2>/dev/null
+}
+
+codex_desktop_tool_test() {
+  local bin output log rc=0
+  bin="$(find_codex_binary)" || return 2
+  output="$(mktemp -t cck-codex-output)"
+  log="$(mktemp -t cck-codex-log)"
+  "$bin" exec --skip-git-repo-check --sandbox read-only --color never \
+    -c 'model_reasoning_effort="low"' -o "$output" \
+    "Use the local shell tool exactly once to run: printf desktop-copilot-ok. Then reply with exactly desktop-copilot-ok and nothing else." \
+    >"$log" 2>&1 || rc=$?
+  if [ "$rc" -eq 0 ] && grep -qx 'desktop-copilot-ok' "$output" 2>/dev/null; then
+    rm -f "$output" "$log"
+    return 0
+  fi
+  warn "Codex executable test failed (exit $rc); diagnostic tail:"
+  tail -n 8 "$log" 2>/dev/null || true
+  rm -f "$output" "$log"
+  return 1
+}
+
 do_with_codex() {
-  do_install
+  do_install codex
   step "Setting up Codex (GitHub Copilot via Responses API)"
   write_codex_profile
   if codex_smoke_test; then ok "Codex round-trip through :$NORM_PORT/v1/responses succeeded"; else warn "Codex self-test didn't complete; the proxy is up — try 'codex --profile copilot'"; fi
@@ -847,10 +1121,45 @@ do_with_codex() {
   command -v codex >/dev/null 2>&1 || warn "codex CLI not found on PATH — install it, then use 'codex --profile copilot'"
 }
 
+do_with_codex_desktop() {
+  do_install codex
+  step "Checking GPT-5.6 Sol through Copilot's Responses API"
+  codex_smoke_test "$CODEX_DESKTOP_MODEL" || die \
+    "$CODEX_DESKTOP_MODEL isn't available on this Copilot seat; Codex Desktop config was not changed"
+  ok "$CODEX_DESKTOP_MODEL completed a Responses request"
+
+  step "Setting up Codex Desktop globally (with reversible config merge)"
+  write_codex_catalog
+  merge_codex_desktop_config
+
+  step "Testing a real Codex local-shell tool call"
+  if codex_desktop_tool_test; then
+    ok "Codex completed a local-shell tool call through Copilot"
+  else
+    case "$?" in
+      2) warn "Codex executable not found; config is ready for Codex Desktop when installed" ;;
+      *) warn "direct Responses test passed, but the Codex executable test did not; run --verify for diagnostics" ;;
+    esac
+  fi
+
+  printf '\n%s%s Codex Desktop is configured.%s Fully quit and reopen the app.%s\n' "$G" "$B" "$X" "$X"
+  say "This changes the shared user-level Codex model/provider selection."
+  say "Undo only this change: bash install.sh --restore-codex-desktop"
+}
+
+do_restore_codex_desktop() {
+  need_macos
+  step "Restoring Codex Desktop configuration"
+  restore_codex_desktop_config
+  say ""
+  ok "Codex Desktop settings restored. Fully quit and reopen the app."
+}
+
 # ===========================================================================
 #  commands
 # ===========================================================================
 do_install() {
+  local install_mode="${1:-claude}"
   need_macos
   step "Checking prerequisites"
   ensure_node
@@ -913,31 +1222,39 @@ do_install() {
   fi
 
   step "Installing the watchdog (auto-heals a wedged daemon after sleep/reboot)"
+  printf '%s\n' "$install_mode" > "$WATCHDOG_MODE_FILE"
   write_watchdog
   write_watchdog_plist
   load_service "$WATCHDOG_PLIST" "com.copilot-api-watchdog"
   ok "watchdog active — probes :$API_PORT/:$NORM_PORT every ${WATCHDOG_INTERVAL}s"
 
-  step "Pointing Claude Code at the proxy (~/.claude/settings.json)"
-  merge_settings
-
-  step "End-to-end self-test"
-  if smoke_test; then
-    ok "round-trip through :$NORM_PORT succeeded"
+  if [ "$install_mode" = "codex" ]; then
+    step "Codex proxy ready"
+    ok "watchdog will probe the Responses API (Claude settings left untouched)"
   else
-    warn "smoke test didn't return a message. The services are up; try 'claude' and check /tmp/com.copilot-api.err"
-  fi
+    step "Pointing Claude Code at the proxy (~/.claude/settings.json)"
+    merge_settings
 
-  printf '\n%s%s All set.%s Open a NEW terminal and run: %sclaude%s\n' "$G" "$B" "$X" "$B" "$X"
-  say "Claude Desktop's built-in Claude Code will use this automatically too."
-  say "Add Codex (gpt-5.x):   bash install.sh --with-codex"
+    step "End-to-end self-test"
+    if smoke_test; then
+      ok "round-trip through :$NORM_PORT succeeded"
+    else
+      warn "smoke test didn't return a message. The services are up; try 'claude' and check /tmp/com.copilot-api.err"
+    fi
+
+    printf '\n%s%s All set.%s Open a NEW terminal and run: %sclaude%s\n' "$G" "$B" "$X" "$B" "$X"
+    say "Claude Desktop's built-in Claude Code will use this automatically too."
+  fi
+  say "Add Codex CLI profile:  bash install.sh --with-codex"
+  say "Configure Codex Desktop: bash install.sh --with-codex-desktop"
   say "Health-check anytime:  bash install.sh --verify"
   say "Remove everything:     bash install.sh --uninstall"
 }
 
 do_verify() {
   need_macos
-  local fail=0
+  local fail=0 install_mode="claude"
+  [ -f "$WATCHDOG_MODE_FILE" ] && install_mode="$(cat "$WATCHDOG_MODE_FILE" 2>/dev/null || echo claude)"
   step "Health check"
 
   if service_loaded com.copilot-api; then ok "launchd: com.copilot-api loaded"; else err "launchd: com.copilot-api NOT loaded"; fail=1; fi
@@ -951,18 +1268,27 @@ do_verify() {
   elif ! net_ok; then warn "can't reach github.com — network/VPN issue, not auth; reconnect and re-check"; fail=1
   else err "not authorized to Copilot (run: copilot-api auth)"; fail=1; fi
 
-  if [ -f "$SETTINGS" ] && grep -q "localhost:$NORM_PORT" "$SETTINGS" 2>/dev/null; then
-    ok "settings.json points at :$NORM_PORT"
+  if [ "$install_mode" = "codex" ]; then
+    ok "watchdog mode: Codex Responses API"
   else
-    err "settings.json missing or not pointing at :$NORM_PORT"; fail=1
+    if [ -f "$SETTINGS" ] && grep -q "localhost:$NORM_PORT" "$SETTINGS" 2>/dev/null; then
+      ok "settings.json points at :$NORM_PORT"
+    else
+      err "settings.json missing or not pointing at :$NORM_PORT"; fail=1
+    fi
+    step "Claude end-to-end self-test"
+    if smoke_test; then ok "round-trip through :$NORM_PORT succeeded"; else err "smoke test failed — check /tmp/com.copilot-api.err"; fail=1; fi
   fi
-
-  step "End-to-end self-test"
-  if smoke_test; then ok "round-trip through :$NORM_PORT succeeded"; else err "smoke test failed — check /tmp/com.copilot-api.err"; fail=1; fi
 
   if [ -f "$CODEX_PROFILE" ]; then
     step "Codex check"
     if codex_smoke_test; then ok "Codex /v1/responses round-trip succeeded"; else err "Codex self-test failed — check /tmp/com.copilot-api-normalize.err"; fail=1; fi
+  fi
+
+  if [ -f "$CODEX_CONFIG" ] && grep -qF "$CODEX_ROOT_BEGIN" "$CODEX_CONFIG" 2>/dev/null; then
+    step "Codex Desktop check"
+    if [ -f "$CODEX_CATALOG" ]; then ok "Codex Desktop model catalog present"; else err "Codex Desktop model catalog missing"; fail=1; fi
+    if codex_smoke_test "$CODEX_DESKTOP_MODEL"; then ok "Codex Desktop model round-trip succeeded"; else err "Codex Desktop model round-trip failed"; fail=1; fi
   fi
 
   echo
@@ -976,7 +1302,7 @@ do_uninstall() {
   launchctl unload "$NORM_PLIST" >/dev/null 2>&1 || true
   launchctl unload "$WATCHDOG_PLIST" >/dev/null 2>&1 || true
   rm -f "$API_PLIST" "$NORM_PLIST" "$WATCHDOG_PLIST" && ok "removed launchd services"
-  rm -f "$NORMALIZER" "$WATCHDOG" && ok "removed normalizer + watchdog scripts"
+  rm -f "$NORMALIZER" "$WATCHDOG" "$WATCHDOG_MODE_FILE" && ok "removed normalizer + watchdog scripts"
   rm -f /tmp/com.copilot-api-watchdog.log /tmp/com.copilot-api-watchdog.notified \
         /tmp/com.copilot-api-watchdog.out /tmp/com.copilot-api-watchdog.err 2>/dev/null || true
   rmdir "$KIT_DIR" >/dev/null 2>&1 || true
@@ -1002,6 +1328,10 @@ NODE_EOF
   if [ -f "$CODEX_PROFILE" ]; then
     rm -f "$CODEX_PROFILE" && ok "removed Codex profile ($CODEX_PROFILE)"
   fi
+  if { [ -f "$CODEX_CONFIG" ] && grep -qF "$CODEX_ROOT_BEGIN" "$CODEX_CONFIG" 2>/dev/null; } \
+      || [ -e "$CODEX_CATALOG_BACKUP" ] || [ -e "$CODEX_CATALOG_CREATED_MARKER" ]; then
+    restore_codex_desktop_config
+  fi
 
   say ""
   warn "Left in place (remove manually if you want): copilot-api npm package and your Copilot auth token."
@@ -1013,6 +1343,8 @@ NODE_EOF
 case "${1:-}" in
   ""|install)   do_install ;;
   --with-codex|with-codex) do_with_codex ;;
+  --with-codex-desktop|with-codex-desktop) do_with_codex_desktop ;;
+  --restore-codex-desktop|restore-codex-desktop) do_restore_codex_desktop ;;
   --verify|verify|doctor) do_verify ;;
   --uninstall|uninstall)  do_uninstall ;;
   --help|-h|help)

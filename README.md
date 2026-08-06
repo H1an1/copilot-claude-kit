@@ -67,9 +67,44 @@ The installer:
 
 ## Codex (optional — gpt-5.x via Copilot)
 
-You can also run **OpenAI Codex CLI** on Copilot's models. Codex uses the
-Responses API, which Copilot serves for `gpt-5.x` (including `gpt-5.5`). The
-installer can wire it up:
+Codex uses the Responses API, which Copilot serves for `gpt-5.x`. There are two
+explicit setup modes because Codex Desktop and Codex CLI share
+`~/.codex/config.toml`.
+
+### Codex Desktop (one command)
+
+Send this command to each person who wants to use their own GitHub Copilot
+subscription in Codex Desktop:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/H1an1/copilot-claude-kit/main/install.sh \
+  | bash -s -- --with-codex-desktop
+```
+
+It installs the proxy, asks that person to authorize **their own** GitHub
+account, verifies `gpt-5.6-sol`, safely merges the user-level Codex configuration,
+writes a model catalog, and tests a real local-shell tool call when a Codex
+executable is installed. It uses a Codex Responses health check and leaves
+`~/.claude/settings.json` untouched. Fully quit and reopen Codex Desktop
+afterward.
+
+The merge is deliberately reversible. Existing model/provider values and an
+existing `copilot` provider are preserved in-place, all other Codex settings are
+left alone, and timestamped backups are written. Undo only the Desktop change:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/H1an1/copilot-claude-kit/main/install.sh \
+  | bash -s -- --restore-codex-desktop
+```
+
+> This is a **global user-level switch**: Codex Desktop, Codex CLI, and IDE
+> integrations using the same `~/.codex` directory will all select Copilot until
+> restored. Each user must complete GitHub device authorization themselves.
+> Never share GitHub or Copilot tokens.
+
+### Codex CLI profile (does not change the global selection)
+
+If you only want an opt-in CLI profile:
 
 ```sh
 bash install.sh --with-codex     # writes a Codex profile + sets up the proxy
@@ -99,10 +134,10 @@ base `~/.codex/config.toml` is left untouched — it's a `--profile` overlay.
   Claude Desktop is in **Auto** model mode it picks model + effort for you and
   hides the effort control; switch the model selector from *Auto* to a specific
   model to reveal the effort tiers.
-- **Codex flagship `gpt-5.3-codex` may be gated.** Copilot's `vscode-chat`
-  integration serves `gpt-5.5`/`gpt-5.4` over Responses; some codex-tuned ids are
-  restricted to other integrations and may return `model_not_supported`. Edit
-  `model` in `~/.codex/copilot.config.toml` to one that works for your seat.
+- **Codex models are seat-dependent.** The Desktop installer verifies
+  `gpt-5.6-sol` before changing Codex configuration. The CLI profile defaults to
+  `gpt-5.5`; if that id is unavailable on a particular seat, edit `model` in
+  `~/.codex/copilot.config.toml`.
 
 ## Manage it
 
@@ -110,6 +145,7 @@ base `~/.codex/config.toml` is left untouched — it's a `--profile` overlay.
 bash install.sh --verify      # health check (doctor)
 bash install.sh --uninstall   # remove everything it created (clean revert)
 bash install.sh               # re-run anytime to repair; it's idempotent
+bash install.sh --restore-codex-desktop # undo only the Desktop switch
 ```
 
 `--uninstall` removes the services, the normalizer and watchdog scripts, and the
