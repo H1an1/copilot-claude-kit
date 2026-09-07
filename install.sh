@@ -10,6 +10,7 @@
 #   bash install.sh                     # install / repair (idempotent)
 #   bash install.sh --with-codex        # add a Codex CLI profile
 #   bash install.sh --with-codex-desktop # make Codex Desktop use Copilot
+#   bash install.sh --with-codex-desktop --codex-model gpt-5.6-sol
 #   bash install.sh --restore-codex-desktop # undo only the Desktop change
 #   bash install.sh --verify            # health-check an existing install
 #   bash install.sh --uninstall         # remove everything this script created
@@ -66,7 +67,9 @@ CODEX_CATALOG="$CODEX_DIR/copilot-models.json"
 CODEX_CATALOG_BACKUP="$CODEX_DIR/copilot-models.pre-copilot-claude-kit.json"
 CODEX_CATALOG_CREATED_MARKER="$CODEX_DIR/.copilot-models-created-by-copilot-claude-kit"
 CODEX_CONFIG_CREATED_MARKER="$CODEX_DIR/.config-created-by-copilot-claude-kit"
-CODEX_DESKTOP_MODEL="gpt-5.6-sol"
+CODEX_DESKTOP_MODEL="gpt-6-astra"
+CODEX_VERIFIED_MODELS=()
+CODEX_WATCHDOG_MODEL_FILE="$KIT_DIR/codex-model"
 CODEX_ROOT_BEGIN="# >>> copilot-claude-kit: Codex Desktop model >>>"
 CODEX_ROOT_END="# <<< copilot-claude-kit: Codex Desktop model <<<"
 CODEX_PROVIDER_BEGIN="# >>> copilot-claude-kit: Codex Desktop provider >>>"
@@ -272,6 +275,17 @@ const server = http.createServer((req, res) => {
       if (body.length) {
         try {
           const j = JSON.parse(body.toString("utf8"));
+          // This is a dedicated approval workload, not a chat-model alias.
+          // Fail closed with an actionable explanation; never invent a verdict
+          // or silently run the approval policy on an arbitrary chat model.
+          if (j.model === "codex-auto-review") {
+            res.writeHead(400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: {
+              type: "invalid_request_error", code: "copilot_auto_review_unsupported", param: "model",
+              message: 'Copilot provider does not support codex-auto-review. Select Ask for approval in Codex, or set approvals_reviewer = "user" and approval_policy = "on-request", then start a new task. Also check app-specific reviewer overrides.',
+            } }));
+            return;
+          }
           if (typeof j.model === "string") {
             const fixed = normalize(j.model);
             if (fixed !== j.model) { console.error(`[responses] ${j.model} -> ${fixed}`); j.model = fixed; }
@@ -508,7 +522,9 @@ works_codex_model() {
 }
 
 works_codex() {
-  works_codex_model "gpt-5.6-sol" || works_codex_model "gpt-5.5"
+  local model="gpt-6-astra"
+  [ ! -f "$HOME/.copilot-api/codex-model" ] || model="$(cat "$HOME/.copilot-api/codex-model")"
+  works_codex_model "$model"
 }
 
 works() {
@@ -854,9 +870,12 @@ write_codex_profile() {
 # Written by copilot-claude-kit (bash install.sh --with-codex).
 # A self-contained Codex profile — use it with:   codex --profile copilot
 # It routes Codex through the local proxy to GitHub Copilot's Responses API,
-# which is how gpt-5.x models are served. Edit 'model' to taste.
-model = "gpt-5.5"
+# which is how GPT-6 Astra and GPT-5.x models are served. Edit 'model' to taste.
+model = "$CODEX_DESKTOP_MODEL"
 model_provider = "copilot"
+approval_policy = "on-request"
+approvals_reviewer = "user"
+sandbox_mode = "workspace-write"
 
 [model_providers.copilot]
 name = "GitHub Copilot (local proxy)"
@@ -866,12 +885,42 @@ EOF
   ok "wrote Codex profile: $CODEX_PROFILE"
 }
 
+read_codex_model() {
+  local node
+  node="${NODE_BIN:-$(find_node)}" || return 1
+  "$node" -e 'const fs=require("fs"); const s=fs.readFileSync(process.argv[1],"utf8").split(/^\s*\[/m)[0]; const m=s.match(/^model\s*=\s*"([^"\n]+)"/m); if (!m) process.exit(1); console.log(m[1]);' "$1"
+}
+
 codex_smoke_test() {  # POST /v1/responses through the normalizer; expect a completed response
-  local model="${1:-gpt-5.5}" out
+  local model="${1:-$CODEX_DESKTOP_MODEL}" out node
+  node="${NODE_BIN:-$(find_node)}" || return 1
   out="$(curl -fsS -m 40 "http://localhost:${NORM_PORT}/v1/responses" \
     -H 'content-type: application/json' \
     -d "{\"model\":\"${model}\",\"input\":\"reply with exactly one word: pong\",\"stream\":false}" 2>/dev/null)" || return 1
-  case "$out" in *'"status":"completed"'*|*'"output"'*) return 0 ;; *) return 1 ;; esac
+  printf '%s' "$out" | "$node" -e '
+    let s=""; process.stdin.on("data", c => s+=c); process.stdin.on("end", () => {
+      try { const j=JSON.parse(s); process.exit(j.status === "completed" && !j.error &&
+        Array.isArray(j.output) && j.output.some(o => o.type === "message" &&
+        o.content?.some(c => c.type === "output_text" && c.text?.trim())) ? 0 : 1); }
+      catch { process.exit(1); }
+    });'
+}
+
+# Probe known Codex-capable models with real completions, not cached /models.
+# The explicit/default selection must succeed; alternatives never silently replace it.
+select_codex_models() {
+  local model
+  codex_smoke_test "$CODEX_DESKTOP_MODEL" || die "$CODEX_DESKTOP_MODEL failed its Responses check; Codex config was not changed. Check connectivity/account access, or use --codex-model gpt-5.6-sol."
+  CODEX_VERIFIED_MODELS=("$CODEX_DESKTOP_MODEL")
+  for model in gpt-6-astra gpt-5.6-sol gpt-5.5; do
+    [ "$model" != "$CODEX_DESKTOP_MODEL" ] || continue
+    if codex_smoke_test "$model"; then
+      CODEX_VERIFIED_MODELS+=("$model")
+      ok "Available in Codex picker: $model"
+    else
+      warn "$model did not complete its probe; omitted from picker"
+    fi
+  done
 }
 
 backup_codex_file() {
@@ -937,6 +986,22 @@ write_codex_catalog() {
   ]
 }
 CATALOG_EOF
+  local node
+  node="${NODE_BIN:-$(find_node)}" || die "Node.js required for model catalog"
+  "$node" - "$tmp" "${CODEX_VERIFIED_MODELS[@]}" <<'CATALOG_MODELS_EOF'
+const fs = require("fs");
+const [path, ...ids] = process.argv.slice(2);
+if (!ids.length) throw new Error("No verified Codex models");
+const catalog = JSON.parse(fs.readFileSync(path, "utf8"));
+const template = catalog.models[0];
+const names = { "gpt-6-astra": "GPT-6 Astra", "gpt-5.6-sol": "GPT-5.6 Sol", "gpt-5.5": "GPT-5.5" };
+// Keep the existing conservative proxy context budget. OpenAI's direct API
+// context window is not evidence of the window available on a Copilot seat.
+catalog.models = ids.map((slug, i) => ({ ...template, slug,
+  display_name: `${names[slug] || slug} (Copilot)`, priority: i + 1 }));
+fs.writeFileSync(path, JSON.stringify(catalog, null, 2) + "\n");
+CATALOG_MODELS_EOF
+  [ "$?" -eq 0 ] || { rm -f "$tmp"; die "couldn't build model catalog"; }
   mv "$tmp" "$CODEX_CATALOG" || die "couldn't write $CODEX_CATALOG"
   ok "wrote Codex model catalog: $CODEX_CATALOG"
 }
@@ -983,7 +1048,7 @@ lines = lines.map((line) => line.startsWith(disabled) ? line.slice(disabled.leng
 // Preserve, but temporarily disable, only the root keys Codex Desktop needs.
 let firstTable = lines.findIndex((line) => /^\s*\[/.test(line));
 if (firstTable < 0) firstTable = lines.length;
-const rootKey = /^\s*(model|model_provider|model_catalog_json|model_reasoning_effort)\s*=/;
+const rootKey = /^\s*(model|model_provider|model_catalog_json|model_reasoning_effort|approval_policy|approvals_reviewer|sandbox_mode)\s*=/;
 for (let i = 0; i < firstTable; i++) {
   if (rootKey.test(lines[i])) lines[i] = disabled + lines[i];
 }
@@ -991,13 +1056,15 @@ for (let i = 0; i < firstTable; i++) {
 // Preserve an existing copilot provider table verbatim. The managed provider is
 // appended at the end; restore simply removes ours and uncomments theirs.
 let inCopilotProvider = false;
+let inApprovalPolicy = false;
 for (let i = 0; i < lines.length; i++) {
   const line = lines[i];
   if (/^\s*\[/.test(line)) {
+    inApprovalPolicy = /^\s*\[\s*approval_policy(?:\s*\]|\.)/.test(line);
     inCopilotProvider =
       /^\s*\[\s*model_providers\.(?:copilot|"copilot"|'copilot')(?:\s*\]|\.)/.test(line);
   }
-  if (inCopilotProvider) lines[i] = disabled + line;
+  if (inCopilotProvider || inApprovalPolicy) lines[i] = disabled + line;
 }
 
 firstTable = lines.findIndex((line) => /^\s*\[/.test(line));
@@ -1008,6 +1075,9 @@ const rootBlock = [
   'model_provider = "copilot"',
   `model_catalog_json = ${JSON.stringify(catalogPath)}`,
   'model_reasoning_effort = "high"',
+  'approval_policy = "on-request"',
+  'approvals_reviewer = "user"',
+  'sandbox_mode = "workspace-write"',
   "",
   rootEnd,
 ];
@@ -1027,6 +1097,7 @@ const tmp = configPath + ".tmp." + process.pid;
 fs.writeFileSync(tmp, lines.join("\n"));
 fs.renameSync(tmp, configPath);
 NODE_EOF
+  [ "$?" -eq 0 ] || die "couldn't merge Codex config"
   ok "merged Codex Desktop config: $CODEX_CONFIG"
 }
 
@@ -1112,25 +1183,112 @@ codex_desktop_tool_test() {
   return 1
 }
 
+# A real approval-boundary test. Observe the client approval RPC and decline it;
+# no command outside the sandbox is approved or executed by this installer.
+# A sandbox printf or a model merely repeating a marker cannot pass this check.
+codex_approval_test() {
+  local bin node
+  bin="$(find_codex_binary)" || return 2
+  node="${NODE_BIN:-$(find_node)}" || return 2
+  "$node" - "$bin" <<'APPROVAL_TEST_EOF'
+const { spawn } = require("child_process");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const readline = require("readline");
+const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "cck-approval-"));
+const child = spawn(process.argv[2], ["app-server", "--listen", "stdio://"],
+  { cwd, stdio: ["pipe", "pipe", "pipe"] });
+let sequence = 0, finished = false, observed = false, threadId;
+const pending = new Map();
+function finish(code, message) {
+  if (finished) return;
+  finished = true;
+  clearTimeout(timer);
+  console.log(message);
+  child.kill("SIGTERM");
+  setTimeout(() => { child.kill("SIGKILL"); fs.rmSync(cwd, { recursive: true, force: true }); process.exit(code); }, 300);
+}
+const timer = setTimeout(() => finish(1, "Approval test timed out; approval routing is NOT verified."), 60000);
+child.on("error", e => finish(1, "Cannot start Codex app-server: " + e.message));
+child.on("exit", code => { if (!finished) finish(1, `Codex app-server exited (${code}); approval routing NOT verified.`); });
+// Drain diagnostics without printing credentials, prompts, or unrelated config.
+child.stderr.resume();
+function send(message) { child.stdin.write(JSON.stringify(message) + "\n"); }
+child.stdin.on("error", () => finish(1, "Codex app-server input closed."));
+function rpc(method, params) {
+  return new Promise((resolve, reject) => {
+    const id = ++sequence;
+    pending.set(id, { resolve, reject });
+    send({ id, method, params });
+  });
+}
+readline.createInterface({ input: child.stdout }).on("line", line => {
+  let msg; try { msg = JSON.parse(line); } catch { return; }
+  if (msg.method && msg.id !== undefined) {
+    if (msg.method === "item/commandExecution/requestApproval") {
+      observed = msg.params?.threadId === threadId;
+      send({ id: msg.id, result: { decision: "decline" } });
+      if (observed) finish(0, "Approval boundary verified: Codex sent a client approval request; test declined it without escalation. Desktop UI confirmation still needs a manual check.");
+      else finish(1, "Unexpected approval thread; test failed.");
+    } else {
+      send({ id: msg.id, error: { code: -32601, message: "Installer test does not approve this operation" } });
+      finish(1, "Unexpected approval/tool request: " + msg.method);
+    }
+    return;
+  }
+  if (pending.has(msg.id)) {
+    const p = pending.get(msg.id); pending.delete(msg.id);
+    msg.error ? p.reject(new Error(msg.error.message)) : p.resolve(msg.result);
+  }
+  if (msg.method === "turn/completed" && !observed)
+    finish(1, "Turn finished without a client approval request; approval routing is NOT verified.");
+  if (msg.method === "error" && !msg.params?.willRetry)
+    finish(1, "Codex turn failed; inspect Codex/proxy logs for approval or model errors.");
+});
+(async () => {
+  await rpc("initialize", { clientInfo: { name: "cck_approval_test", version: "1.0" }, capabilities: { experimentalApi: true } });
+  send({ method: "initialized" });
+  const { config } = await rpc("config/read", { includeLayers: false });
+  if (config.model_provider !== "copilot") throw new Error("Effective provider is not copilot");
+  if (config.approvals_reviewer !== "user" || config.approval_policy !== "on-request")
+    throw new Error('Effective config must use approvals_reviewer="user" and approval_policy="on-request". Select Ask for approval, then retry.');
+  // Detect app-specific auto reviewers that would survive the root setting.
+  for (const [name, app] of Object.entries(config.apps || {})) {
+    if (app?.approvals_reviewer && app.approvals_reviewer !== "user")
+      throw new Error(`apps.${name}.approvals_reviewer still selects automatic review`);
+  }
+  const t = await rpc("thread/start", { cwd, ephemeral: true, sandbox: "read-only" });
+  threadId = t.thread.id;
+  if (t.approvalPolicy !== "on-request" || t.approvalsReviewer !== "user")
+    throw new Error("Thread effective approval settings are not manual; check managed requirements or permission profiles.");
+  await rpc("turn/start", { threadId, effort: "low", input: [{ type: "text", text:
+    "Installation diagnostic: call the shell tool once with command `printf cck-approval-probe`, explicitly request sandbox_permissions=require_escalated and give justification 'Test the approval dialog'. Do not run it without escalation, use another tool, or retry. The client will decline the request; that is the expected result. No other action is needed." }] });
+})().catch(e => finish(1, "Approval test failed: " + e.message));
+APPROVAL_TEST_EOF
+}
+
 do_with_codex() {
   do_install codex
   step "Setting up Codex (GitHub Copilot via Responses API)"
+  codex_smoke_test "$CODEX_DESKTOP_MODEL" || die "$CODEX_DESKTOP_MODEL failed its Responses check; Codex profile was not changed"
   write_codex_profile
+  printf '%s\n' "$CODEX_DESKTOP_MODEL" > "$CODEX_WATCHDOG_MODEL_FILE"
   if codex_smoke_test; then ok "Codex round-trip through :$NORM_PORT/v1/responses succeeded"; else warn "Codex self-test didn't complete; the proxy is up — try 'codex --profile copilot'"; fi
   printf '\n%s%s Codex ready.%s Run: %scodex --profile copilot%s\n' "$G" "$B" "$X" "$B" "$X"
   command -v codex >/dev/null 2>&1 || warn "codex CLI not found on PATH — install it, then use 'codex --profile copilot'"
 }
 
 do_with_codex_desktop() {
+  local approval_rc=0
   do_install codex
-  step "Checking GPT-5.6 Sol through Copilot's Responses API"
-  codex_smoke_test "$CODEX_DESKTOP_MODEL" || die \
-    "$CODEX_DESKTOP_MODEL isn't available on this Copilot seat; Codex Desktop config was not changed"
-  ok "$CODEX_DESKTOP_MODEL completed a Responses request"
+  step "Checking Codex models through Copilot's Responses API"
+  select_codex_models
 
   step "Setting up Codex Desktop globally (with reversible config merge)"
   write_codex_catalog
   merge_codex_desktop_config
+  printf '%s\n' "$CODEX_DESKTOP_MODEL" > "$CODEX_WATCHDOG_MODEL_FILE"
 
   step "Testing a real Codex local-shell tool call"
   if codex_desktop_tool_test; then
@@ -1142,9 +1300,19 @@ do_with_codex_desktop() {
     esac
   fi
 
+  step "Testing the real Codex approval boundary (request then decline)"
+  if codex_approval_test; then
+    ok "Manual approval routing passed"
+  else
+    approval_rc=$?
+    warn "Approval self-test NOT verified. Run --verify after installing/updating Codex; use Ask for approval in the app."
+  fi
+
   printf '\n%s%s Codex Desktop is configured.%s Fully quit and reopen the app.%s\n' "$G" "$B" "$X" "$X"
   say "This changes the shared user-level Codex model/provider selection."
   say "Undo only this change: bash install.sh --restore-codex-desktop"
+  [ "$approval_rc" -eq 2 ] && return 0  # no installed Codex: explicitly reported as unverified
+  return "$approval_rc"
 }
 
 do_restore_codex_desktop() {
@@ -1282,13 +1450,21 @@ do_verify() {
 
   if [ -f "$CODEX_PROFILE" ]; then
     step "Codex check"
-    if codex_smoke_test; then ok "Codex /v1/responses round-trip succeeded"; else err "Codex self-test failed — check /tmp/com.copilot-api-normalize.err"; fail=1; fi
+    local profile_model
+    profile_model="$(read_codex_model "$CODEX_PROFILE")" || profile_model=""
+    if [ -n "$profile_model" ] && codex_smoke_test "$profile_model"; then ok "Codex /v1/responses round-trip succeeded"; else err "Codex self-test failed — check /tmp/com.copilot-api-normalize.err"; fail=1; fi
   fi
 
   if [ -f "$CODEX_CONFIG" ] && grep -qF "$CODEX_ROOT_BEGIN" "$CODEX_CONFIG" 2>/dev/null; then
     step "Codex Desktop check"
     if [ -f "$CODEX_CATALOG" ]; then ok "Codex Desktop model catalog present"; else err "Codex Desktop model catalog missing"; fail=1; fi
-    if codex_smoke_test "$CODEX_DESKTOP_MODEL"; then ok "Codex Desktop model round-trip succeeded"; else err "Codex Desktop model round-trip failed"; fail=1; fi
+    local selected node
+    node="$(find_node)" || die "Node.js is required for verification"
+    # Read the installed choice rather than checking this script's new default.
+    selected="$(read_codex_model "$CODEX_CONFIG")" || selected=""
+    if [ -n "$selected" ] && codex_smoke_test "$selected"; then ok "Codex Desktop $selected round-trip succeeded"; else err "Codex Desktop model round-trip failed"; fail=1; fi
+    step "Codex approval boundary check"
+    if codex_approval_test; then ok "Manual approval routing passed"; else err "Approval routing NOT verified (ordinary chat success is insufficient)"; fail=1; fi
   fi
 
   echo
@@ -1302,7 +1478,7 @@ do_uninstall() {
   launchctl unload "$NORM_PLIST" >/dev/null 2>&1 || true
   launchctl unload "$WATCHDOG_PLIST" >/dev/null 2>&1 || true
   rm -f "$API_PLIST" "$NORM_PLIST" "$WATCHDOG_PLIST" && ok "removed launchd services"
-  rm -f "$NORMALIZER" "$WATCHDOG" "$WATCHDOG_MODE_FILE" && ok "removed normalizer + watchdog scripts"
+  rm -f "$NORMALIZER" "$WATCHDOG" "$WATCHDOG_MODE_FILE" "$CODEX_WATCHDOG_MODEL_FILE" && ok "removed normalizer + watchdog scripts"
   rm -f /tmp/com.copilot-api-watchdog.log /tmp/com.copilot-api-watchdog.notified \
         /tmp/com.copilot-api-watchdog.out /tmp/com.copilot-api-watchdog.err 2>/dev/null || true
   rmdir "$KIT_DIR" >/dev/null 2>&1 || true
@@ -1340,7 +1516,20 @@ NODE_EOF
   ok "${B}Uninstalled.${X}"
 }
 
-case "${1:-}" in
+# CLI dispatch (also the boundary used by offline tests).
+COMMAND="${1:-}"
+[ "$#" -eq 0 ] || shift
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --codex-model)
+      [ "$#" -ge 2 ] || die "--codex-model requires a model id"
+      case "$2" in gpt-6-astra|gpt-5.6-sol|gpt-5.5) CODEX_DESKTOP_MODEL="$2" ;; *) die "Supported selections: gpt-6-astra, gpt-5.6-sol, gpt-5.5" ;; esac
+      case "$COMMAND" in --with-codex|with-codex|--with-codex-desktop|with-codex-desktop) ;; *) die "--codex-model requires a Codex install mode" ;; esac
+      shift 2 ;;
+    *) die "Unknown argument: $1" ;;
+  esac
+done
+case "$COMMAND" in
   ""|install)   do_install ;;
   --with-codex|with-codex) do_with_codex ;;
   --with-codex-desktop|with-codex-desktop) do_with_codex_desktop ;;
@@ -1350,5 +1539,5 @@ case "${1:-}" in
   --help|-h|help)
     sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
     ;;
-  *) die "Unknown argument: $1  (try --help)" ;;
+  *) die "Unknown argument: $COMMAND  (try --help)" ;;
 esac
