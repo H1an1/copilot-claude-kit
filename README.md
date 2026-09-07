@@ -65,9 +65,9 @@ The installer:
    subagents), not just a shell alias.
 7. Verifies the whole chain end-to-end before declaring success.
 
-## Codex (optional — gpt-5.x via Copilot)
+## Codex (optional — GPT-6 Astra and GPT-5.x via Copilot)
 
-Codex uses the Responses API, which Copilot serves for `gpt-5.x`. There are two
+Codex uses the Responses API. Model access depends on your Copilot account. There are two
 explicit setup modes because Codex Desktop and Codex CLI share
 `~/.codex/config.toml`.
 
@@ -82,15 +82,31 @@ curl -fsSL https://raw.githubusercontent.com/H1an1/copilot-claude-kit/main/insta
 ```
 
 It installs the proxy, asks that person to authorize **their own** GitHub
-account, verifies `gpt-5.6-sol`, safely merges the user-level Codex configuration,
-writes a model catalog, and tests a real local-shell tool call when a Codex
-executable is installed. It uses a Codex Responses health check and leaves
+account, verifies `gpt-6-astra`, safely merges the user-level Codex configuration,
+and writes a model catalog. It also probes `gpt-5.6-sol` and `gpt-5.5` and adds
+those that complete a real Responses request to the Desktop model picker.
+When Codex is installed, it tests a local shell call and a real approval request. It uses a Codex Responses health check and leaves
 `~/.claude/settings.json` untouched. Fully quit and reopen Codex Desktop
 afterward.
 
+The original command now defaults to **GPT-6 Astra**. To choose Sol instead:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/H1an1/copilot-claude-kit/main/install.sh \
+  | bash -s -- --with-codex-desktop --codex-model gpt-5.6-sol
+```
+
+`--codex-model` accepts `gpt-6-astra`, `gpt-5.6-sol`, or `gpt-5.5` in either
+Codex install mode. If the selected model fails, installation stops before
+changing Codex configuration; it never silently substitutes another model.
+After restart, use the Desktop model picker to select another verified model.
+Re-run the installer to refresh the catalog when account access changes.
+The catalog retains a conservative 272k context budget for the proxy; it does
+not assume Copilot exposes OpenAI's full direct-API context window.
+
 The merge is deliberately reversible. Existing model/provider values and an
-existing `copilot` provider are preserved in-place, all other Codex settings are
-left alone, and timestamped backups are written. Undo only the Desktop change:
+existing `copilot` provider and approval/sandbox defaults are preserved in-place,
+unrelated Codex settings are left alone, and timestamped backups are written. Undo only the Desktop change:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/H1an1/copilot-claude-kit/main/install.sh \
@@ -113,7 +129,7 @@ codex --profile copilot          # run Codex on Copilot
 
 This adds a `/responses` passthrough to the local proxy (copilot-api doesn't
 proxy Responses itself) and writes a self-contained Codex profile at
-`~/.codex/copilot.config.toml` (`model = "gpt-5.5"`, pointed at the proxy). Your
+`~/.codex/copilot.config.toml` (`model = "gpt-6-astra"`, pointed at the proxy). Your
 base `~/.codex/config.toml` is left untouched — it's a `--profile` overlay.
 
 > ### ⚠️ Extra caution for Codex on a corporate/enterprise Copilot seat
@@ -134,10 +150,64 @@ base `~/.codex/config.toml` is left untouched — it's a `--profile` overlay.
   Claude Desktop is in **Auto** model mode it picks model + effort for you and
   hides the effort control; switch the model selector from *Auto* to a specific
   model to reveal the effort tiers.
-- **Codex models are seat-dependent.** The Desktop installer verifies
-  `gpt-5.6-sol` before changing Codex configuration. The CLI profile defaults to
-  `gpt-5.5`; if that id is unavailable on a particular seat, edit `model` in
-  `~/.codex/copilot.config.toml`.
+- **Codex models are seat-dependent.** The selected model must pass a real
+  Responses request. A model shown in OpenAI's catalog or Copilot's cached
+  `/models` response is not proof your account can call it.
+- **Automatic approval review is not supported by this Copilot adapter.** Use
+  the manual approval mode below. Changing the chat model does not change the
+  separate approval workload.
+
+
+## Codex approval compatibility and self-test
+
+Newer Codex versions can send a separate `model=codex-auto-review` request
+when **Approve for me** reviews a tool action. The old proxy forwarded that id
+unchanged; the reported Copilot rejection explains why ordinary chat works but
+approval fails. This does not establish that GPT-6 itself caused the failure.
+
+The installer uses the [official manual approval configuration](https://learn.chatgpt.com/docs/config-file/config-reference):
+
+```toml
+approval_policy = "on-request"
+approvals_reviewer = "user"
+sandbox_mode = "workspace-write"
+```
+
+Fully quit and reopen Desktop, start a new task, and select **Ask for approval**
+in the permissions menu. Existing tasks, named permission profiles, managed
+requirements, or `apps.<id>.approvals_reviewer` overrides can take precedence.
+The doctor reports incompatible app overrides; set those reviewers to `user`
+where appropriate. Organization-managed requirements must be handled by your
+administrator. See [Codex sandboxing](https://learn.chatgpt.com/docs/sandboxing)
+and [automatic review](https://learn.chatgpt.com/docs/sandboxing/auto-review).
+
+The proxy returns `copilot_auto_review_unsupported` with these instructions if
+an old task still requests `codex-auto-review`. It does not alias that dedicated
+model to Astra/Sol, synthesize approval decisions, or disable the sandbox.
+
+The checks distinguish three different things:
+
+1. A completed Responses request with actual text (failed/incomplete/empty
+   responses cannot pass just because they contain an `output` field).
+2. The existing ordinary local-shell smoke test during installation.
+3. During installation and `--verify`, a temporary app-server task requesting shell escalation. The test
+   requires an actual `item/commandExecution/requestApproval` callback and
+   declines it. A plain `printf` or a final text marker cannot pass this check.
+
+The third check validates approval routing, not approval model availability or
+Desktop button rendering. It uses the installed Codex binary, has a 60-second
+limit, and reports **NOT verified** if the callback is missing, the binary is
+absent, or the effective reviewer is incompatible. A failed installed-binary
+approval test makes installation/doctor return nonzero; configuration remains
+available for diagnosis. A missing binary during installation is an explicit
+skip. The watchdog checks the last installed chat model, not approvals.
+
+For a final Desktop check, select **Ask for approval** and ask it to request
+approval for a read-only GET to your running local service (for example
+`http://127.0.0.1:7147/`). Confirm the dialog appears, inspect the proposed
+command, then approve it. A service HTTP error is separate from an approval
+failure. This UI check must be done in the affected task; a CLI probe cannot
+certify a task's saved permissions.
 
 ## Manage it
 
@@ -216,6 +286,21 @@ Specific symptoms:
 
 For the full mechanism, design rationale, and a manual step-by-step (no script),
 see [`SETUP-DETAILS.md`](./SETUP-DETAILS.md).
+
+## Development checks
+
+Requires Node.js and Python 3.11+ (Python is only used for repository tests).
+
+```sh
+bash -n install.sh
+python3 -m unittest discover -s tests -v
+node --test tests/normalizer.test.cjs
+CCK_CODEX_INTEGRATION=1 python3 -m unittest discover -s tests -v
+```
+
+The optional integration test runs the installed Codex against a local Responses
+fixture with an isolated home. It verifies the real approval RPC without using
+Copilot credentials. Live account access and the Desktop UI still need testing.
 
 ## License
 

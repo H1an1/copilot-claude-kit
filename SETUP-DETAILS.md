@@ -1,5 +1,10 @@
 # Run Claude Code on GitHub Copilot (macOS, background daemon)
 
+For GPT-6 Astra, Codex model selection, and manual approval compatibility, use
+the [Codex installer instructions in README](./README.md#codex-optional--gpt-6-astra-and-gpt-5x-via-copilot).
+The manual proxy example below documents the Claude path; use `install.sh` for
+the current embedded Responses adapter and Codex approval diagnostics.
+
 Point a fresh Claude Code install at GitHub Copilot's models, with the proxy running as an
 always-on background service. End state: **open a terminal, type `claude`, it just works** —
 no visible window, no manual start, survives reboot.
