@@ -9,7 +9,7 @@
 # Usage:
 #   bash install.sh                     # install / repair (idempotent)
 #   bash install.sh --with-codex        # add a Codex CLI profile
-#   bash install.sh --with-codex-desktop # make Codex Desktop use Copilot
+#   bash install.sh --with-codex-desktop # configure Claude Code + Codex Desktop
 #   bash install.sh --with-codex-desktop --codex-model gpt-5.6-sol
 #   bash install.sh --restore-codex-desktop # undo only the Desktop change
 #   bash install.sh --verify            # health-check an existing install
@@ -535,7 +535,15 @@ works_codex() {
 works() {
   local mode="claude"
   [ -f "$MODE_FILE" ] && mode="$(cat "$MODE_FILE" 2>/dev/null || echo claude)"
-  case "$mode" in codex) works_codex ;; *) works_claude ;; esac
+  case "$mode" in
+    codex) works_codex ;;
+    combined)
+      local failed=0
+      works_claude || { log "Claude Messages probe failed"; failed=1; }
+      works_codex || { log "Codex Responses probe failed"; failed=1; }
+      return "$failed" ;;
+    *) works_claude ;;
+  esac
 }
 
 # Is the machine actually online? Without this, a closed lid / dropped VPN is
@@ -1294,8 +1302,9 @@ do_with_codex() {
 }
 
 do_with_codex_desktop() {
-  local approval_rc=0
-  do_install codex
+  local approval_rc=0 claude_rc=0
+  # Share setup/auth once; still configure Codex if the Claude model probe fails.
+  do_install combined || claude_rc=$?
   step "Checking Codex models through Copilot's Responses API"
   select_codex_models
 
@@ -1322,9 +1331,10 @@ do_with_codex_desktop() {
     warn "Approval self-test NOT verified. Run --verify after installing/updating Codex; use Ask for approval in the app."
   fi
 
-  printf '\n%s%s Codex Desktop is configured.%s Fully quit and reopen the app.%s\n' "$G" "$B" "$X" "$X"
+  printf '\n%s%s Claude Code + Codex Desktop are configured.%s Fully quit and reopen both clients.%s\n' "$G" "$B" "$X" "$X"
   say "This changes the shared user-level Codex model/provider selection."
-  say "Undo only this change: bash install.sh --restore-codex-desktop"
+  say "Undo only the Codex change (keep Claude): bash install.sh --restore-codex-desktop"
+  [ "$claude_rc" -eq 0 ] || return "$claude_rc"
   [ "$approval_rc" -eq 2 ] && return 0  # no installed Codex: explicitly reported as unverified
   return "$approval_rc"
 }
@@ -1333,6 +1343,10 @@ do_restore_codex_desktop() {
   need_macos
   step "Restoring Codex Desktop configuration"
   restore_codex_desktop_config
+  if [ -f "$WATCHDOG_MODE_FILE" ] && [ "$(cat "$WATCHDOG_MODE_FILE")" = "combined" ]; then
+    printf '%s\n' claude > "$WATCHDOG_MODE_FILE"
+    ok "Claude configuration retained; watchdog now checks Claude"
+  fi
   say ""
   ok "Codex Desktop settings restored. Fully quit and reopen the app."
 }
@@ -1416,7 +1430,7 @@ do_install() {
   else
     say "Opus 5.5 requires Claude Code 2.1.280 or newer: run claude update."
     step "Pointing Claude Code at the proxy (~/.claude/settings.json)"
-    merge_settings
+    merge_settings || die "could not write Claude settings"
 
     step "End-to-end self-test"
     if smoke_test; then
@@ -1462,8 +1476,14 @@ do_verify() {
     else
       err "settings.json missing or not pointing at :$NORM_PORT"; fail=1
     fi
+    [ "$install_mode" != "combined" ] || ok "watchdog mode: Claude Messages + Codex Responses"
     step "Claude end-to-end self-test"
     if smoke_test; then ok "Opus 5.5 round-trip through :$NORM_PORT succeeded"; else err "smoke test failed — check /tmp/com.copilot-api.err"; fail=1; fi
+  fi
+
+  if [ "$install_mode" = "combined" ] && ! grep -qF "$CODEX_ROOT_BEGIN" "$CODEX_CONFIG" 2>/dev/null; then
+    err "Combined install is missing Codex Desktop configuration; re-run --with-codex-desktop"
+    fail=1
   fi
 
   if [ -f "$CODEX_PROFILE" ]; then
@@ -1486,7 +1506,7 @@ do_verify() {
   fi
 
   echo
-  if [ "$fail" -eq 0 ]; then ok "${B}Everything looks healthy.${X}"; else err "${B}Some checks failed (see above).${X} Re-run 'bash install.sh' to repair."; exit 1; fi
+  if [ "$fail" -eq 0 ]; then ok "${B}Everything looks healthy.${X}"; else err "${B}Some checks failed (see above).${X} Re-run your original install command (--with-codex-desktop for both clients) to repair."; exit 1; fi
 }
 
 do_uninstall() {

@@ -104,10 +104,10 @@ Codex uses the Responses API. Model access depends on your Copilot account. Ther
 explicit setup modes because Codex Desktop and Codex CLI share
 `~/.codex/config.toml`.
 
-### Codex Desktop (one command)
+### Claude Code + Codex Desktop (one command)
 
 Send this command to each person who wants to use their own GitHub Copilot
-subscription in Codex Desktop:
+subscription in both Claude Code and Codex Desktop:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/H1an1/copilot-claude-kit/main/install.sh \
@@ -115,12 +115,21 @@ curl -fsSL https://raw.githubusercontent.com/H1an1/copilot-claude-kit/main/insta
 ```
 
 It installs the proxy, asks that person to authorize **their own** GitHub
-account, verifies `gpt-6-astra`, safely merges the user-level Codex configuration,
+account once, configures Claude Code for Opus 5.5, verifies `gpt-6-astra`,
+safely merges the user-level Codex configuration,
 and writes a model catalog. It also probes `gpt-5.6-sol` and `gpt-5.5` and adds
 those that complete a real Responses request to the Desktop model picker.
-When Codex is installed, it tests a local shell call and a real approval request. It uses a Codex Responses health check and leaves
-`~/.claude/settings.json` untouched. Fully quit and reopen Codex Desktop
-afterward.
+It updates both `~/.claude/settings.json` and `~/.codex/config.toml` and runs
+separate Claude and Codex self-tests. The shared watchdog probes both API paths.
+When Codex is installed, it also tests a local shell call and an approval request.
+Fully quit and reopen both clients afterward; update Claude Code to 2.1.280+.
+
+This flag now adds Claude configuration even on an existing Codex-only install.
+No flag still configures Claude alone; `--with-codex` remains a Codex CLI-only
+profile. Both clients share the same proxy and GitHub authorization. If the
+Claude model probe fails, Codex setup still proceeds and the command returns
+nonzero so the partial failure is visible. A failed Codex model probe leaves
+the Claude configuration in place and stops before changing Codex settings.
 
 The original command now defaults to **GPT-6 Astra**. To choose Sol instead:
 
@@ -139,7 +148,8 @@ not assume Copilot exposes OpenAI's full direct-API context window.
 
 The merge is deliberately reversible. Existing model/provider values and an
 existing `copilot` provider and approval/sandbox defaults are preserved in-place,
-unrelated Codex settings are left alone, and timestamped backups are written. Undo only the Desktop change:
+unrelated Codex settings are left alone, and timestamped backups are written. Undo only the Desktop change (Claude stays configured, and combined-mode
+watchdog monitoring returns to Claude):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/H1an1/copilot-claude-kit/main/install.sh \
@@ -232,7 +242,8 @@ limit, and reports **NOT verified** if the callback is missing, the binary is
 absent, or the effective reviewer is incompatible. A failed installed-binary
 approval test makes installation/doctor return nonzero; configuration remains
 available for diagnosis. A missing binary during installation is an explicit
-skip. The watchdog checks the last installed chat model, not approvals.
+skip. In combined mode the watchdog checks Claude through Haiku and Codex
+through the last installed GPT model; it does not check approvals or Opus access.
 
 For a final Desktop check, select **Ask for approval** and ask it to request
 approval for a read-only GET to your running local service (for example
