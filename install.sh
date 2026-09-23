@@ -196,7 +196,7 @@ function pick(prefs) {
   for (const p of prefs) if (supported.has(p)) return p;
   return supported.size === 0 ? prefs[0] : null;
 }
-const defaultOpus = () => pick(["claude-opus-4.8", "claude-opus-4.7", "claude-opus-4.6", "claude-opus-4.5"]);
+const defaultOpus = () => pick(["claude-opus-5.5", "claude-opus-5-5", "claude-opus-5", "claude-opus-4.8", "claude-opus-4.7", "claude-opus-4.6", "claude-opus-4.5"]);
 const defaultSonnet = () => pick(["claude-sonnet-4.6", "claude-sonnet-4.5"]);
 const defaultHaiku = () => pick(["claude-haiku-4.5", "claude-haiku-4"]);
 
@@ -244,6 +244,11 @@ function normalize(model) {
   if (supported.has(base)) return base;
   const dotted = base.replace(/^claude-(opus|sonnet|haiku)-(\d+)-(\d+)/, "claude-$1-$2.$3");
   if (supported.has(dotted)) return dotted;
+  // Prefer the exact upstream spelling, including newer dash-form model ids.
+  const dashed = dotted.replace(/^(claude-(?:opus|sonnet|haiku)-\d+)\.(\d+)$/, "$1-$2");
+  if (supported.has(dashed)) return dashed;
+  // Never silently substitute another generation for an explicit version.
+  if (/^claude-(opus|sonnet|haiku)-\d+(?:\.\d+)?$/.test(dotted)) return dotted;
   // If dash->dot rewriting actually changed the id, the input was a dash-form
   // claude id (e.g. claude-opus-4-8) and `dotted` is the canonical dot-form
   // Copilot serves (claude-opus-4.8). Return it UNCONDITIONALLY — even when the
@@ -841,6 +846,9 @@ Object.assign(d.env, {
   // in-app model/effort picker in Claude Code & Claude Desktop ("model is set
   // by ANTHROPIC_MODEL"), so you can't change effort. The normalizer maps
   // whatever model id the app sends, so pinning is unnecessary.
+  // Defaults keep /model usable; an explicit saved model selection wins.
+  ANTHROPIC_DEFAULT_OPUS_MODEL: "claude-opus-5-5",
+  ANTHROPIC_DEFAULT_MODEL: "opus",
   ANTHROPIC_SMALL_FAST_MODEL: "claude-haiku-4.5",
   CLAUDE_CODE_DISABLE_LEGACY_MODEL_REMAP: "1",
   CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1",
@@ -854,12 +862,18 @@ console.log("  merged env into " + path + (fs.existsSync(path + ".bak") ? " (bac
 NODE_EOF
 }
 
-smoke_test() {  # send a dash-form id through the normalizer; expect a real message back
-  local out
+smoke_test() {  # test Opus 5.5 explicitly, without a fallback to older Opus
+  local out node
+  node="${NODE_BIN:-$(find_node)}" || return 1
   out="$(curl -fsS -m 30 "http://localhost:${NORM_PORT}/v1/messages" \
     -H 'content-type: application/json' -H 'x-api-key: dummy' -H 'anthropic-version: 2023-06-01' \
-    -d '{"model":"claude-opus-4-8","max_tokens":5,"messages":[{"role":"user","content":"ping"}]}' 2>/dev/null)" || return 1
-  case "$out" in *'"type":"message"'*) return 0 ;; *) return 1 ;; esac
+    -d '{"model":"claude-opus-5-5","stream":false,"max_tokens":1024,"messages":[{"role":"user","content":"ping"}]}' 2>/dev/null)" || return 1
+  printf '%s' "$out" | "$node" -e '
+    let s=""; process.stdin.on("data", c => s+=c); process.stdin.on("end", () => {
+      try { const j=JSON.parse(s); process.exit(j.type === "message" && !j.error &&
+        Array.isArray(j.content) && j.content.some(c => c.type === "text" && c.text?.trim()) ? 0 : 1); }
+      catch { process.exit(1); }
+    });'
 }
 
 CODEX_PROFILE="$CODEX_DIR/copilot.config.toml"
@@ -1327,7 +1341,7 @@ do_restore_codex_desktop() {
 #  commands
 # ===========================================================================
 do_install() {
-  local install_mode="${1:-claude}"
+  local install_mode="${1:-claude}" smoke_rc=0
   need_macos
   step "Checking prerequisites"
   ensure_node
@@ -1400,23 +1414,27 @@ do_install() {
     step "Codex proxy ready"
     ok "watchdog will probe the Responses API (Claude settings left untouched)"
   else
+    say "Opus 5.5 requires Claude Code 2.1.280 or newer: run claude update."
     step "Pointing Claude Code at the proxy (~/.claude/settings.json)"
     merge_settings
 
     step "End-to-end self-test"
     if smoke_test; then
-      ok "round-trip through :$NORM_PORT succeeded"
+      ok "Opus 5.5 round-trip through :$NORM_PORT succeeded"
     else
-      warn "smoke test didn't return a message. The services are up; try 'claude' and check /tmp/com.copilot-api.err"
+      smoke_rc=1
+      warn "Opus 5.5 self-test failed: check account rollout/model policy and /tmp/com.copilot-api.err. Opus 5.5 access is NOT verified."
     fi
 
-    printf '\n%s%s All set.%s Open a NEW terminal and run: %sclaude%s\n' "$G" "$B" "$X" "$B" "$X"
+    printf '\n%s%s Claude proxy configured.%s Open a NEW terminal and run: %sclaude%s\n' "$G" "$B" "$X" "$B" "$X"
     say "Claude Desktop's built-in Claude Code will use this automatically too."
+    say "If a saved model still selects an older version, run /model opus (or /model claude-opus-5-5)."
   fi
   say "Add Codex CLI profile:  bash install.sh --with-codex"
   say "Configure Codex Desktop: bash install.sh --with-codex-desktop"
   say "Health-check anytime:  bash install.sh --verify"
   say "Remove everything:     bash install.sh --uninstall"
+  return "$smoke_rc"
 }
 
 do_verify() {
@@ -1445,7 +1463,7 @@ do_verify() {
       err "settings.json missing or not pointing at :$NORM_PORT"; fail=1
     fi
     step "Claude end-to-end self-test"
-    if smoke_test; then ok "round-trip through :$NORM_PORT succeeded"; else err "smoke test failed — check /tmp/com.copilot-api.err"; fail=1; fi
+    if smoke_test; then ok "Opus 5.5 round-trip through :$NORM_PORT succeeded"; else err "smoke test failed — check /tmp/com.copilot-api.err"; fail=1; fi
   fi
 
   if [ -f "$CODEX_PROFILE" ]; then
@@ -1490,7 +1508,7 @@ const path = process.argv[2];
 let d; try { d = JSON.parse(fs.readFileSync(path, "utf8")); } catch { process.exit(0); }
 if (d && d.env) {
   fs.copyFileSync(path, path + ".bak");
-  for (const k of ["ANTHROPIC_BASE_URL","ANTHROPIC_AUTH_TOKEN","ANTHROPIC_MODEL","ANTHROPIC_SMALL_FAST_MODEL",
+  for (const k of ["ANTHROPIC_BASE_URL","ANTHROPIC_AUTH_TOKEN","ANTHROPIC_MODEL","ANTHROPIC_DEFAULT_OPUS_MODEL","ANTHROPIC_DEFAULT_MODEL","ANTHROPIC_SMALL_FAST_MODEL",
                     "CLAUDE_CODE_DISABLE_LEGACY_MODEL_REMAP","CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS",
                     "DISABLE_PROMPT_CACHING","CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"]) delete d.env[k];
   if (Object.keys(d.env).length === 0) delete d.env;

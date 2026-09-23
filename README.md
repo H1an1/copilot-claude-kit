@@ -25,6 +25,39 @@ That's it.
 > **Don't want to pipe to bash?** Download `install.sh`, read it, then run
 > `bash install.sh`. It's a single self-contained script.
 
+## Claude Opus 5.5
+
+The original command, without `--with-codex`, configures Claude and now targets
+Opus 5.5:
+
+```sh
+claude update  # Opus 5.5 requires Claude Code 2.1.280 or newer
+curl -fsSL https://raw.githubusercontent.com/H1an1/copilot-claude-kit/main/install.sh | bash
+```
+
+Restart Claude afterward. New sessions default to `opus` unless you already
+saved a model selection; use `/model opus` to switch that selection. The
+installer maps the Opus alias to `claude-opus-5-5` via
+`ANTHROPIC_DEFAULT_OPUS_MODEL` and sets `ANTHROPIC_DEFAULT_MODEL=opus` without
+locking `ANTHROPIC_MODEL`. Other models remain selectable.
+
+The normalizer accepts dash/dot IDs, dated picker IDs, and `[1m]` suffixes,
+using the spelling advertised by the upstream model list. The installer
+and `--verify` explicitly test Opus 5.5; failure is reported, never hidden by
+substituting an older Opus. A failed Opus self-test returns a nonzero exit status
+while leaving the configuration available for diagnosis. The watchdog still uses a small Haiku probe
+for general proxy health, so it does not certify Opus access.
+
+[GitHub's rollout announcement](https://github.blog/changelog/2026-09-22-claude-opus-5-5-is-now-available-in-github-copilot/)
+notes gradual availability and organization model policies. Installation
+cannot grant model access to an account. Follow the
+[Claude Code version requirement](https://code.claude.com/docs/en/model-config)
+and [Opus 5.5 migration guide](https://platform.claude.com/docs/en/models/opus-5-5/migration-guide):
+use an up-to-date client for always-on thinking and the changed tool protocol.
+The adapter preserves thinking data and does not rewrite forced tool choices
+into different behavior. A `[1m]` label alone does not establish the context
+window exposed through Copilot.
+
 ## What it does
 
 ```
@@ -141,11 +174,10 @@ base `~/.codex/config.toml` is left untouched — it's a `--profile` overlay.
 
 ## Limitations
 
-- **Context window is 200k, not 1M.** Copilot's `vscode-chat` integration (what
-  the proxy uses) doesn't expose any 1M-context Claude variant — its model list
-  has no `-1m` ids, and the `anthropic-beta: context-1m` header isn't honored.
-  Picking "1M context" in a model picker gains nothing (the `[1m]` suffix is
-  normalized away to the standard 200k model). 200k is the honest ceiling here.
+- **Claude context limits depend on Copilot.** The earlier 4.x setup used a
+  conservative 200k budget. The proxy normalizes `[1m]` suffixes; that does not
+  establish 1M support. Verify the upstream limits for newer models rather than
+  assuming their direct Anthropic API context window applies here.
 - **Effort/model in Claude Desktop is controlled by the app, not the proxy.** If
   Claude Desktop is in **Auto** model mode it picks model + effort for you and
   hides the effort control; switch the model selector from *Auto* to a specific

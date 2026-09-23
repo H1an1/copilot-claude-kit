@@ -93,6 +93,26 @@ enabled = false
             self.assertNotEqual(r.returncode,0)
             self.assertFalse((self.home/'.copilot-api').exists())
 
+    def test_claude_settings_defaults_preserve_picker_and_saved_model(self):
+        d=self.home/'.claude'; d.mkdir()
+        path=d/'settings.json'
+        path.write_text(json.dumps({'model':'sonnet','env':{'ANTHROPIC_MODEL':'old','OTHER':'keep'}}))
+        self.run_shell('NODE_BIN="$(command -v node)"; merge_settings; merge_settings')
+        settings=json.loads(path.read_text())
+        self.assertEqual(settings['model'],'sonnet')
+        self.assertEqual(settings['env']['ANTHROPIC_DEFAULT_OPUS_MODEL'],'claude-opus-5-5')
+        self.assertEqual(settings['env']['ANTHROPIC_DEFAULT_MODEL'],'opus')
+        self.assertNotIn('ANTHROPIC_MODEL',settings['env'])
+        self.assertEqual(settings['env']['OTHER'],'keep')
+
+    def test_claude_smoke_checks_new_model_and_actual_text(self):
+        for payload,expected in [({'type':'message','content':[{'type':'text','text':'pong'}]},0),
+                                 ({'type':'message','content':[]},1),({'type':'error','error':{'message':'unsupported'}},1)]:
+            (self.home/'response').write_text(json.dumps(payload))
+            r=self.run_shell('curl() { printf "%s\\n" "$@" > "$HOME/curl-args"; cat "$HOME/response"; }; smoke_test',ok=False)
+            self.assertEqual(r.returncode,expected,r.stdout+r.stderr)
+            self.assertIn('claude-opus-5-5',(self.home/'curl-args').read_text())
+
     def test_cli_profile(self):
         self.run_shell('CODEX_DESKTOP_MODEL=gpt-5.6-sol; write_codex_profile')
         cfg=tomllib.loads((self.home/'.codex/copilot.config.toml').read_text())
