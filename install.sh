@@ -9,7 +9,7 @@
 # Usage:
 #   bash install.sh                     # install / repair (idempotent)
 #   bash install.sh --with-codex        # add a Codex CLI profile
-#   bash install.sh --with-codex-desktop # make Codex Desktop use Copilot
+#   bash install.sh --with-codex-desktop # configure Claude Code + Codex Desktop
 #   bash install.sh --with-codex-desktop --codex-model gpt-5.6-sol
 #   bash install.sh --restore-codex-desktop # undo only the Desktop change
 #   bash install.sh --verify            # health-check an existing install
@@ -196,7 +196,7 @@ function pick(prefs) {
   for (const p of prefs) if (supported.has(p)) return p;
   return supported.size === 0 ? prefs[0] : null;
 }
-const defaultOpus = () => pick(["claude-opus-4.8", "claude-opus-4.7", "claude-opus-4.6", "claude-opus-4.5"]);
+const defaultOpus = () => pick(["claude-opus-5.5", "claude-opus-5-5", "claude-opus-5", "claude-opus-4.8", "claude-opus-4.7", "claude-opus-4.6", "claude-opus-4.5"]);
 const defaultSonnet = () => pick(["claude-sonnet-4.6", "claude-sonnet-4.5"]);
 const defaultHaiku = () => pick(["claude-haiku-4.5", "claude-haiku-4"]);
 
@@ -244,6 +244,11 @@ function normalize(model) {
   if (supported.has(base)) return base;
   const dotted = base.replace(/^claude-(opus|sonnet|haiku)-(\d+)-(\d+)/, "claude-$1-$2.$3");
   if (supported.has(dotted)) return dotted;
+  // Prefer the exact upstream spelling, including newer dash-form model ids.
+  const dashed = dotted.replace(/^(claude-(?:opus|sonnet|haiku)-\d+)\.(\d+)$/, "$1-$2");
+  if (supported.has(dashed)) return dashed;
+  // Never silently substitute another generation for an explicit version.
+  if (/^claude-(opus|sonnet|haiku)-\d+(?:\.\d+)?$/.test(dotted)) return dotted;
   // If dash->dot rewriting actually changed the id, the input was a dash-form
   // claude id (e.g. claude-opus-4-8) and `dotted` is the canonical dot-form
   // Copilot serves (claude-opus-4.8). Return it UNCONDITIONALLY — even when the
@@ -530,7 +535,15 @@ works_codex() {
 works() {
   local mode="claude"
   [ -f "$MODE_FILE" ] && mode="$(cat "$MODE_FILE" 2>/dev/null || echo claude)"
-  case "$mode" in codex) works_codex ;; *) works_claude ;; esac
+  case "$mode" in
+    codex) works_codex ;;
+    combined)
+      local failed=0
+      works_claude || { log "Claude Messages probe failed"; failed=1; }
+      works_codex || { log "Codex Responses probe failed"; failed=1; }
+      return "$failed" ;;
+    *) works_claude ;;
+  esac
 }
 
 # Is the machine actually online? Without this, a closed lid / dropped VPN is
@@ -841,6 +854,9 @@ Object.assign(d.env, {
   // in-app model/effort picker in Claude Code & Claude Desktop ("model is set
   // by ANTHROPIC_MODEL"), so you can't change effort. The normalizer maps
   // whatever model id the app sends, so pinning is unnecessary.
+  // Defaults keep /model usable; an explicit saved model selection wins.
+  ANTHROPIC_DEFAULT_OPUS_MODEL: "claude-opus-5-5",
+  ANTHROPIC_DEFAULT_MODEL: "opus",
   ANTHROPIC_SMALL_FAST_MODEL: "claude-haiku-4.5",
   CLAUDE_CODE_DISABLE_LEGACY_MODEL_REMAP: "1",
   CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1",
@@ -854,12 +870,18 @@ console.log("  merged env into " + path + (fs.existsSync(path + ".bak") ? " (bac
 NODE_EOF
 }
 
-smoke_test() {  # send a dash-form id through the normalizer; expect a real message back
-  local out
+smoke_test() {  # test Opus 5.5 explicitly, without a fallback to older Opus
+  local out node
+  node="${NODE_BIN:-$(find_node)}" || return 1
   out="$(curl -fsS -m 30 "http://localhost:${NORM_PORT}/v1/messages" \
     -H 'content-type: application/json' -H 'x-api-key: dummy' -H 'anthropic-version: 2023-06-01' \
-    -d '{"model":"claude-opus-4-8","max_tokens":5,"messages":[{"role":"user","content":"ping"}]}' 2>/dev/null)" || return 1
-  case "$out" in *'"type":"message"'*) return 0 ;; *) return 1 ;; esac
+    -d '{"model":"claude-opus-5-5","stream":false,"max_tokens":1024,"messages":[{"role":"user","content":"ping"}]}' 2>/dev/null)" || return 1
+  printf '%s' "$out" | "$node" -e '
+    let s=""; process.stdin.on("data", c => s+=c); process.stdin.on("end", () => {
+      try { const j=JSON.parse(s); process.exit(j.type === "message" && !j.error &&
+        Array.isArray(j.content) && j.content.some(c => c.type === "text" && c.text?.trim()) ? 0 : 1); }
+      catch { process.exit(1); }
+    });'
 }
 
 CODEX_PROFILE="$CODEX_DIR/copilot.config.toml"
@@ -1280,8 +1302,9 @@ do_with_codex() {
 }
 
 do_with_codex_desktop() {
-  local approval_rc=0
-  do_install codex
+  local approval_rc=0 claude_rc=0
+  # Share setup/auth once; still configure Codex if the Claude model probe fails.
+  do_install combined || claude_rc=$?
   step "Checking Codex models through Copilot's Responses API"
   select_codex_models
 
@@ -1308,9 +1331,10 @@ do_with_codex_desktop() {
     warn "Approval self-test NOT verified. Run --verify after installing/updating Codex; use Ask for approval in the app."
   fi
 
-  printf '\n%s%s Codex Desktop is configured.%s Fully quit and reopen the app.%s\n' "$G" "$B" "$X" "$X"
+  printf '\n%s%s Claude Code + Codex Desktop are configured.%s Fully quit and reopen both clients.%s\n' "$G" "$B" "$X" "$X"
   say "This changes the shared user-level Codex model/provider selection."
-  say "Undo only this change: bash install.sh --restore-codex-desktop"
+  say "Undo only the Codex change (keep Claude): bash install.sh --restore-codex-desktop"
+  [ "$claude_rc" -eq 0 ] || return "$claude_rc"
   [ "$approval_rc" -eq 2 ] && return 0  # no installed Codex: explicitly reported as unverified
   return "$approval_rc"
 }
@@ -1319,6 +1343,10 @@ do_restore_codex_desktop() {
   need_macos
   step "Restoring Codex Desktop configuration"
   restore_codex_desktop_config
+  if [ -f "$WATCHDOG_MODE_FILE" ] && [ "$(cat "$WATCHDOG_MODE_FILE")" = "combined" ]; then
+    printf '%s\n' claude > "$WATCHDOG_MODE_FILE"
+    ok "Claude configuration retained; watchdog now checks Claude"
+  fi
   say ""
   ok "Codex Desktop settings restored. Fully quit and reopen the app."
 }
@@ -1327,7 +1355,7 @@ do_restore_codex_desktop() {
 #  commands
 # ===========================================================================
 do_install() {
-  local install_mode="${1:-claude}"
+  local install_mode="${1:-claude}" smoke_rc=0
   need_macos
   step "Checking prerequisites"
   ensure_node
@@ -1400,23 +1428,27 @@ do_install() {
     step "Codex proxy ready"
     ok "watchdog will probe the Responses API (Claude settings left untouched)"
   else
+    say "Opus 5.5 requires Claude Code 2.1.280 or newer: run claude update."
     step "Pointing Claude Code at the proxy (~/.claude/settings.json)"
-    merge_settings
+    merge_settings || die "could not write Claude settings"
 
     step "End-to-end self-test"
     if smoke_test; then
-      ok "round-trip through :$NORM_PORT succeeded"
+      ok "Opus 5.5 round-trip through :$NORM_PORT succeeded"
     else
-      warn "smoke test didn't return a message. The services are up; try 'claude' and check /tmp/com.copilot-api.err"
+      smoke_rc=1
+      warn "Opus 5.5 self-test failed: check account rollout/model policy and /tmp/com.copilot-api.err. Opus 5.5 access is NOT verified."
     fi
 
-    printf '\n%s%s All set.%s Open a NEW terminal and run: %sclaude%s\n' "$G" "$B" "$X" "$B" "$X"
+    printf '\n%s%s Claude proxy configured.%s Open a NEW terminal and run: %sclaude%s\n' "$G" "$B" "$X" "$B" "$X"
     say "Claude Desktop's built-in Claude Code will use this automatically too."
+    say "If a saved model still selects an older version, run /model opus (or /model claude-opus-5-5)."
   fi
   say "Add Codex CLI profile:  bash install.sh --with-codex"
   say "Configure Codex Desktop: bash install.sh --with-codex-desktop"
   say "Health-check anytime:  bash install.sh --verify"
   say "Remove everything:     bash install.sh --uninstall"
+  return "$smoke_rc"
 }
 
 do_verify() {
@@ -1444,8 +1476,14 @@ do_verify() {
     else
       err "settings.json missing or not pointing at :$NORM_PORT"; fail=1
     fi
+    [ "$install_mode" != "combined" ] || ok "watchdog mode: Claude Messages + Codex Responses"
     step "Claude end-to-end self-test"
-    if smoke_test; then ok "round-trip through :$NORM_PORT succeeded"; else err "smoke test failed — check /tmp/com.copilot-api.err"; fail=1; fi
+    if smoke_test; then ok "Opus 5.5 round-trip through :$NORM_PORT succeeded"; else err "smoke test failed — check /tmp/com.copilot-api.err"; fail=1; fi
+  fi
+
+  if [ "$install_mode" = "combined" ] && ! grep -qF "$CODEX_ROOT_BEGIN" "$CODEX_CONFIG" 2>/dev/null; then
+    err "Combined install is missing Codex Desktop configuration; re-run --with-codex-desktop"
+    fail=1
   fi
 
   if [ -f "$CODEX_PROFILE" ]; then
@@ -1468,7 +1506,7 @@ do_verify() {
   fi
 
   echo
-  if [ "$fail" -eq 0 ]; then ok "${B}Everything looks healthy.${X}"; else err "${B}Some checks failed (see above).${X} Re-run 'bash install.sh' to repair."; exit 1; fi
+  if [ "$fail" -eq 0 ]; then ok "${B}Everything looks healthy.${X}"; else err "${B}Some checks failed (see above).${X} Re-run your original install command (--with-codex-desktop for both clients) to repair."; exit 1; fi
 }
 
 do_uninstall() {
@@ -1490,7 +1528,7 @@ const path = process.argv[2];
 let d; try { d = JSON.parse(fs.readFileSync(path, "utf8")); } catch { process.exit(0); }
 if (d && d.env) {
   fs.copyFileSync(path, path + ".bak");
-  for (const k of ["ANTHROPIC_BASE_URL","ANTHROPIC_AUTH_TOKEN","ANTHROPIC_MODEL","ANTHROPIC_SMALL_FAST_MODEL",
+  for (const k of ["ANTHROPIC_BASE_URL","ANTHROPIC_AUTH_TOKEN","ANTHROPIC_MODEL","ANTHROPIC_DEFAULT_OPUS_MODEL","ANTHROPIC_DEFAULT_MODEL","ANTHROPIC_SMALL_FAST_MODEL",
                     "CLAUDE_CODE_DISABLE_LEGACY_MODEL_REMAP","CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS",
                     "DISABLE_PROMPT_CACHING","CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"]) delete d.env[k];
   if (Object.keys(d.env).length === 0) delete d.env;

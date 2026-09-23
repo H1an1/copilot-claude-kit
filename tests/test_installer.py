@@ -93,6 +93,110 @@ enabled = false
             self.assertNotEqual(r.returncode,0)
             self.assertFalse((self.home/'.copilot-api').exists())
 
+    def test_claude_settings_defaults_preserve_picker_and_saved_model(self):
+        d=self.home/'.claude'; d.mkdir()
+        path=d/'settings.json'
+        path.write_text(json.dumps({'model':'sonnet','env':{'ANTHROPIC_MODEL':'old','OTHER':'keep'}}))
+        self.run_shell('NODE_BIN="$(command -v node)"; merge_settings; merge_settings')
+        settings=json.loads(path.read_text())
+        self.assertEqual(settings['model'],'sonnet')
+        self.assertEqual(settings['env']['ANTHROPIC_DEFAULT_OPUS_MODEL'],'claude-opus-5-5')
+        self.assertEqual(settings['env']['ANTHROPIC_DEFAULT_MODEL'],'opus')
+        self.assertNotIn('ANTHROPIC_MODEL',settings['env'])
+        self.assertEqual(settings['env']['OTHER'],'keep')
+
+    def test_claude_smoke_checks_new_model_and_actual_text(self):
+        for payload,expected in [({'type':'message','content':[{'type':'text','text':'pong'}]},0),
+                                 ({'type':'message','content':[]},1),({'type':'error','error':{'message':'unsupported'}},1)]:
+            (self.home/'response').write_text(json.dumps(payload))
+            r=self.run_shell('curl() { printf "%s\\n" "$@" > "$HOME/curl-args"; cat "$HOME/response"; }; smoke_test',ok=False)
+            self.assertEqual(r.returncode,expected,r.stdout+r.stderr)
+            self.assertIn('claude-opus-5-5',(self.home/'curl-args').read_text())
+
+    def combined_stubs(self, claude_rc=0, approval_rc=0):
+        return f'''
+for fn in need_macos write_plist load_service wait_for_port is_authed_retry write_watchdog_plist; do
+  eval "$fn() {{ return 0; }}"
+done
+ensure_node() {{ NODE_BIN="$(command -v node)"; }}
+ensure_copilot_api() {{ COPILOT_API_BIN=true; }}
+smoke_test() {{ return {claude_rc}; }}
+select_codex_models() {{ CODEX_VERIFIED_MODELS=(gpt-6-astra); }}
+codex_desktop_tool_test() {{ return 0; }}
+codex_approval_test() {{ return {approval_rc}; }}
+'''
+
+    def test_combined_install_writes_both_and_restore_keeps_claude(self):
+        self.run_shell(self.combined_stubs() + 'do_with_codex_desktop')
+        settings=self.home/'.claude/settings.json'
+        before=settings.read_text()
+        self.assertEqual(json.loads(before)['env']['ANTHROPIC_DEFAULT_OPUS_MODEL'],'claude-opus-5-5')
+        config=tomllib.loads((self.home/'.codex/config.toml').read_text())
+        self.assertEqual(config['model_provider'],'copilot')
+        mode=self.home/'.copilot-api/watchdog-mode'
+        self.assertEqual(mode.read_text().strip(),'combined')
+        self.run_shell('need_macos() { :; }; do_restore_codex_desktop')
+        self.assertEqual(settings.read_text(),before)
+        self.assertEqual(mode.read_text().strip(),'claude')
+
+    def test_combined_claude_failure_still_configures_codex_and_fails(self):
+        # A missing Codex binary (2) must not mask an earlier Claude failure.
+        result=self.run_shell(self.combined_stubs(claude_rc=1,approval_rc=2)+'do_with_codex_desktop',ok=False)
+        self.assertEqual(result.returncode,1,result.stdout+result.stderr)
+        self.assertTrue((self.home/'.codex/config.toml').exists())
+        self.assertTrue((self.home/'.claude/settings.json').exists())
+
+    def test_combined_codex_failure_keeps_claude(self):
+        result=self.run_shell(self.combined_stubs()+'''select_codex_models() { die "unavailable"; }
+do_with_codex_desktop''',ok=False)
+        self.assertEqual(result.returncode,1)
+        self.assertTrue((self.home/'.claude/settings.json').exists())
+        self.assertFalse((self.home/'.codex/config.toml').exists())
+
+    def test_combined_doctor_checks_both_and_reports_partial_failure(self):
+        self.run_shell(self.combined_stubs()+'do_with_codex_desktop')
+        for claude_rc,codex_rc in [(0,0),(1,0),(0,1)]:
+            result=self.run_shell(f'''need_macos() {{ :; }}
+service_loaded() {{ return 0; }}
+curl() {{ return 0; }}
+is_authed_retry() {{ return 0; }}
+smoke_test() {{ echo checked-claude; return {claude_rc}; }}
+codex_smoke_test() {{ echo checked-codex; return {codex_rc}; }}
+codex_approval_test() {{ return 0; }}
+do_verify''',ok=False)
+            self.assertEqual(result.returncode,int(bool(claude_rc or codex_rc)))
+            self.assertIn('checked-claude',result.stdout)
+            self.assertIn('checked-codex',result.stdout)
+
+    def test_single_client_install_modes_remain_separate(self):
+        self.run_shell(self.combined_stubs()+'''codex_smoke_test() { return 0; }
+do_with_codex''')
+        self.assertFalse((self.home/'.claude/settings.json').exists())
+        self.assertTrue((self.home/'.codex/copilot.config.toml').exists())
+        self.assertFalse((self.home/'.codex/config.toml').exists())
+        self.run_shell(self.combined_stubs()+'do_install')
+        self.assertTrue((self.home/'.claude/settings.json').exists())
+        self.assertFalse((self.home/'.codex/config.toml').exists())
+        self.assertEqual((self.home/'.copilot-api/watchdog-mode').read_text().strip(),'claude')
+
+    def test_combined_watchdog_probes_both_even_if_first_fails(self):
+        source=SOURCE.split("<<'WATCHDOG_EOF'\n")[1].split('\nWATCHDOG_EOF')[0]
+        # Source definitions only: never run launchctl or the background loop.
+        lib=self.home/'watchdog-functions.sh'
+        lib.write_text(source.split('\ntrim_log\n')[0])
+        mode=self.home/'mode'; mode.write_text('combined')
+        for claude_rc,codex_rc in [(0,0),(1,0),(0,1),(1,1)]:
+            script=f'''source "$HOME/watchdog-functions.sh"
+MODE_FILE="$HOME/mode"
+log() {{ :; }}
+works_claude() {{ echo claude >> "$HOME/probes"; return {claude_rc}; }}
+works_codex() {{ echo codex >> "$HOME/probes"; return {codex_rc}; }}
+works'''
+            (self.home/'probes').write_text('')
+            result=self.run_shell(script,ok=False)
+            self.assertEqual(result.returncode,int(bool(claude_rc or codex_rc)))
+            self.assertEqual((self.home/'probes').read_text().splitlines(),['claude','codex'])
+
     def test_cli_profile(self):
         self.run_shell('CODEX_DESKTOP_MODEL=gpt-5.6-sol; write_codex_profile')
         cfg=tomllib.loads((self.home/'.codex/copilot.config.toml').read_text())
