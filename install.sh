@@ -162,29 +162,51 @@ const HOSTED_TOOLS = new Set([
 // OpenAI-platform-only fields). Stripped before forwarding.
 const UNSUPPORTED_PARAMS = ["service_tier", "store", "safety_identifier", "prompt_cache_key"];
 
+// Bound discovery even when the peer accepts a socket but never finishes.
+// Concurrent requests share one refresh; failed refreshes retain the last catalog.
+let modelRefresh = null;
 function refreshModels() {
-  return new Promise((resolve) => {
+  if (modelRefresh) return modelRefresh;
+  modelRefresh = new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      lastFetch = Date.now(); // back off failed discovery too
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      finish();
+      req.destroy();
+    }, 5000);
     const req = http.request(
       { host: UPSTREAM_HOST, port: UPSTREAM_PORT, path: "/v1/models", method: "GET" },
       (r) => {
         let b = "";
         r.on("data", (c) => (b += c));
+        r.on("error", finish);
+        r.on("aborted", finish);
         r.on("end", () => {
+          if (settled) return;
           try {
             const data = JSON.parse(b).data;
+            if (r.statusCode !== 200 || !Array.isArray(data) ||
+                !data.every(m => m && typeof m.id === "string")) throw new Error("Invalid model catalog");
             supported = new Set(data.map((m) => m.id));
-            modelMaxOut = new Map(
-              data.map((m) => [m.id, m?.capabilities?.limits?.max_output_tokens || 0])
-            );
-            lastFetch = Date.now();
-          } catch {}
-          resolve();
+            modelMaxOut = new Map(data.map((m) => {
+              const limit = m?.capabilities?.limits?.max_output_tokens;
+              return [m.id, Number.isSafeInteger(limit) && limit > 0 ? limit : 0];
+            }));
+          } catch { /* keep the last valid catalog */ }
+          finish();
         });
       }
     );
-    req.on("error", () => resolve());
+    req.on("error", finish);
     req.end();
-  });
+  }).finally(() => { modelRefresh = null; });
+  return modelRefresh;
 }
 
 // Prefer what the live model list advertises. But when `supported` is empty —
@@ -402,7 +424,9 @@ const server = http.createServer((req, res) => {
         // reports "command missing". Pin max_tokens to the model's real ceiling
         // (per Copilot: 32k/64k) so even the longest pipeline fits; clamp down
         // if a client asked for more than the model allows (avoids HTTP 400).
-        const maxOut = j.stream === false ? 16000 : (modelMaxOut.get(j.model) || modelCeiling(j.model));
+        const ceiling = modelMaxOut.get(j.model) || modelCeiling(j.model);
+        // Keep the non-streaming default, but never exceed upstream limits.
+        const maxOut = j.stream === false ? Math.min(16000, ceiling) : ceiling;
         if (j.max_tokens !== maxOut) {
           console.error(`[normalize] max_tokens ${j.max_tokens} -> ${maxOut}`);
           j.max_tokens = maxOut;
@@ -678,14 +702,47 @@ ensure_copilot_api() {
 # Anthropic thinking blocks. Idempotent; re-applies after every reinstall.
 patch_copilot_api() {
   local m; m="$(npm root -g 2>/dev/null)/copilot-api/dist/main.js"
-  [ -f "$m" ] || return 0
-  node -e '
-    const f=process.argv[1]; const fs=require("fs"); let s=fs.readFileSync(f,"utf8");
-    if (s.includes("reasoning_effort: payload.thinking")) process.exit(0);
-    s=s.replace("tool_choice: translateAnthropicToolChoiceToOpenAI(payload.tool_choice)\n\t};","tool_choice: translateAnthropicToolChoiceToOpenAI(payload.tool_choice),\n\t\treasoning_effort: payload.thinking?.type===\"enabled\"?\"high\":void 0\n\t};");
-    s=s.replace("content: [...allTextBlocks, ...allToolUseBlocks],","content: [...(response.choices[0]?.message?.reasoning_text?[{type:\"thinking\",thinking:response.choices[0].message.reasoning_text,signature:\"\"}]:[]), ...allTextBlocks, ...allToolUseBlocks],");
-    fs.writeFileSync(f,s);
-  ' "$m" 2>/dev/null && ok "patched copilot-api for extended thinking" || warn "thinking patch skipped"
+  if [ ! -f "$m" ]; then
+    warn "extended-thinking compatibility NOT verified: copilot-api bundle not found"
+    return 0
+  fi
+  if "${NODE_BIN:-node}" - "$m" <<'THINKING_PATCH_EOF'
+const f = process.argv[2], fs = require("fs");
+const original = fs.readFileSync(f, "utf8");
+let s = original;
+const patches = [
+  ["tool_choice: translateAnthropicToolChoiceToOpenAI(payload.tool_choice)\n\t};",
+   "tool_choice: translateAnthropicToolChoiceToOpenAI(payload.tool_choice),\n\t\treasoning_effort: payload.thinking?.type===\"enabled\"?\"high\":void 0\n\t};"],
+  ["content: [...allTextBlocks, ...allToolUseBlocks],",
+   "content: [...(response.choices[0]?.message?.reasoning_text?[{type:\"thinking\",thinking:response.choices[0].message.reasoning_text,signature:\"\"}]:[]), ...allTextBlocks, ...allToolUseBlocks],"],
+];
+// Validate BOTH replacements before writing; repair a partially applied patch.
+for (const [before, after] of patches) {
+  const oldCount = s.split(before).length - 1;
+  const newCount = s.split(after).length - 1;
+  if (oldCount === 0 && newCount === 1) continue;
+  if (oldCount !== 1 || newCount !== 0) {
+    console.error("Upstream bundle does not match the supported thinking patch; no changes written.");
+    process.exit(1);
+  }
+  s = s.replace(before, after);
+}
+if (s !== original) {
+  const tmp = f + ".cck-tmp." + process.pid;
+  try {
+    fs.writeFileSync(tmp, s, { mode: fs.statSync(f).mode });
+    fs.renameSync(tmp, f);
+  } finally {
+    if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
+  }
+}
+console.log(s === original ? "extended-thinking patch already verified" : "extended-thinking patch applied and verified");
+THINKING_PATCH_EOF
+  then
+    ok "copilot-api extended-thinking patch verified"
+  else
+    warn "extended-thinking compatibility NOT verified; unsupported upstream bundle or write failure (see above)"
+  fi
 }
 
 # copilot-api refreshes its Copilot token every ~25 min. Upstream's catch block

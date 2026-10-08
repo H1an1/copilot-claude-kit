@@ -197,6 +197,56 @@ works'''
             self.assertEqual(result.returncode,int(bool(claude_rc or codex_rc)))
             self.assertEqual((self.home/'probes').read_text().splitlines(),['claude','codex'])
 
+    def thinking_bundle(self):
+        bundle=self.home/'npm/copilot-api/dist/main.js'
+        bundle.parent.mkdir(parents=True,exist_ok=True)
+        bundle.write_text('''const request = {
+    tool_choice: translateAnthropicToolChoiceToOpenAI(payload.tool_choice)
+\t};
+const responseMessage = {
+    content: [...allTextBlocks, ...allToolUseBlocks],
+};
+''')
+        return bundle
+
+    def apply_thinking_patch(self):
+        return self.run_shell('npm() { printf "%s" "$HOME/npm"; }; patch_copilot_api')
+
+    def test_thinking_patch_is_verified_and_idempotent(self):
+        bundle=self.thinking_bundle()
+        first=self.apply_thinking_patch()
+        patched=bundle.read_text()
+        self.assertIn('patch applied and verified',first.stdout)
+        self.assertIn('reasoning_effort: payload.thinking',patched)
+        self.assertIn('message.reasoning_text',patched)
+        second=self.apply_thinking_patch()
+        self.assertIn('already verified',second.stdout)
+        self.assertEqual(bundle.read_text(),patched)
+
+    def test_thinking_patch_repairs_partial_install(self):
+        bundle=self.thinking_bundle();original=bundle.read_text()
+        self.apply_thinking_patch();patched=bundle.read_text()
+        # Retain only the earlier request-side change, as in an interrupted patch.
+        bundle.write_text(patched.split('const responseMessage')[0]+original[original.index('const responseMessage'):])
+        self.apply_thinking_patch()
+        self.assertEqual(bundle.read_text(),patched)
+
+    def test_thinking_patch_reports_unknown_or_ambiguous_bundle_without_writing(self):
+        bundle=self.thinking_bundle();original=bundle.read_text()
+        for content in ['// new upstream with no anchors',
+                        original.replace('content: [...allTextBlocks, ...allToolUseBlocks],','content: newFormat,'),
+                        original+original]:
+            bundle.write_text(content)
+            result=self.apply_thinking_patch()
+            self.assertIn('compatibility NOT verified',result.stdout)
+            self.assertNotIn('✓ copilot-api',result.stdout)
+            self.assertEqual(bundle.read_text(),content)
+
+    def test_missing_thinking_bundle_is_reported(self):
+        result=self.apply_thinking_patch()
+        self.assertIn('bundle not found',result.stdout)
+        self.assertIn('NOT verified',result.stdout)
+
     def test_cli_profile(self):
         self.run_shell('CODEX_DESKTOP_MODEL=gpt-5.6-sol; write_codex_profile')
         cfg=tomllib.loads((self.home/'.codex/copilot.config.toml').read_text())

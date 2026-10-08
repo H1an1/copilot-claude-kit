@@ -313,6 +313,17 @@ Escalate in this order:
 
 Specific symptoms:
 
+- **`extended-thinking compatibility NOT verified`** → the installed copilot-api
+  bundle did not match both known patch locations, was missing, or could not be
+  written. The installer reports the limitation instead of claiming success.
+  An unsupported bundle is left unchanged; basic proxy setup can still continue.
+- **A stalled model-list request** → discovery now expires after five seconds,
+  keeps the last valid catalog, and backs off for 30 seconds. Concurrent client
+  requests share the same refresh, so a stuck lookup cannot indefinitely block
+  proxy startup. This deadline covers model discovery, not model generation.
+- **Non-streaming output limits** → the proxy's 16k default is now capped by the
+  model's advertised output ceiling; streaming budgets continue to use that ceiling.
+
 - **It says "not authorized to Copilot"** → re-run `bash install.sh` and complete
   the browser step.
 - **`400` errors in `claude`** → almost always the normalizer isn't on the path.
