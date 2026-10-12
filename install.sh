@@ -10,7 +10,7 @@
 #   bash install.sh                     # install / repair (idempotent)
 #   bash install.sh --with-codex        # add a Codex CLI profile
 #   bash install.sh --with-codex-desktop # configure Claude Code + Codex Desktop
-#   bash install.sh --with-codex-desktop --codex-model gpt-5.6-sol
+#   bash install.sh --with-codex-desktop --codex-model gpt-6.1-sol
 #   bash install.sh --restore-codex-desktop # undo only the Desktop change
 #   bash install.sh --verify            # health-check an existing install
 #   bash install.sh --uninstall         # remove everything this script created
@@ -59,6 +59,10 @@ WATCHDOG_MODE_FILE="$KIT_DIR/watchdog-mode"
 SETTINGS="$HOME/.claude/settings.json"
 API_PORT=4141
 NORM_PORT=4142
+# copilot-api 0.7.0 has no --host flag; its server (srvx) binds every interface
+# unless HOST is set (srvx: hostname ?? process.env.HOST). Without this, :4141
+# (unauthenticated, backed by your Copilot token) is reachable from the LAN.
+BIND_HOST="127.0.0.1"
 WATCHDOG_INTERVAL=90
 GH_TOKEN_FILE="$HOME/.local/share/copilot-api/github_token"
 CODEX_DIR="$HOME/.codex"
@@ -68,6 +72,12 @@ CODEX_CATALOG_BACKUP="$CODEX_DIR/copilot-models.pre-copilot-claude-kit.json"
 CODEX_CATALOG_CREATED_MARKER="$CODEX_DIR/.copilot-models-created-by-copilot-claude-kit"
 CODEX_CONFIG_CREATED_MARKER="$CODEX_DIR/.config-created-by-copilot-claude-kit"
 CODEX_DESKTOP_MODEL="gpt-6-astra"
+# Copilot models served over /responses that Codex can select (newest first).
+# Each is probed with a real completion before it is listed in a picker.
+# Live-verified over /responses on 2026-10-08 except gpt-5.6-luna and
+# gpt-5.6-sol-fast (listed by Copilot, not yet exercised); the probe gates them.
+CODEX_MODEL_CHOICES=(gpt-6.1-sol gpt-6-astra gpt-6-sol gpt-6-luna gpt-5.6-sol gpt-5.6-sol-fast gpt-5.6-terra gpt-5.6-luna gpt-5.5 gpt-5.3-codex)
+CODEX_PROFILE_CATALOG="$CODEX_DIR/copilot-profile-models.json"
 CODEX_VERIFIED_MODELS=()
 CODEX_WATCHDOG_MODEL_FILE="$KIT_DIR/codex-model"
 CODEX_ROOT_BEGIN="# >>> copilot-claude-kit: Codex Desktop model >>>"
@@ -164,29 +174,32 @@ const UNSUPPORTED_PARAMS = ["service_tier", "store", "safety_identifier", "promp
 
 // Bound discovery even when the peer accepts a socket but never finishes.
 // Concurrent requests share one refresh; failed refreshes retain the last catalog.
+// The 30s back-off only applies once a valid catalog exists: with no catalog
+// (cold start while copilot-api is still booting), every request retries, as
+// guessing ids blind for 30s turns into avoidable model_not_supported errors.
 let modelRefresh = null;
 function refreshModels() {
   if (modelRefresh) return modelRefresh;
   modelRefresh = new Promise((resolve) => {
-    let settled = false;
-    const finish = () => {
+    let settled = false, req = null;
+    const finish = (ok) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      lastFetch = Date.now(); // back off failed discovery too
+      if (ok === true || supported.size > 0) lastFetch = Date.now();
       resolve();
     };
     const timer = setTimeout(() => {
       finish();
-      req.destroy();
+      if (req) req.destroy();
     }, 5000);
-    const req = http.request(
+    req = http.request(
       { host: UPSTREAM_HOST, port: UPSTREAM_PORT, path: "/v1/models", method: "GET" },
       (r) => {
         let b = "";
         r.on("data", (c) => (b += c));
-        r.on("error", finish);
-        r.on("aborted", finish);
+        r.on("error", () => finish());
+        r.on("aborted", () => finish());
         r.on("end", () => {
           if (settled) return;
           try {
@@ -198,50 +211,92 @@ function refreshModels() {
               const limit = m?.capabilities?.limits?.max_output_tokens;
               return [m.id, Number.isSafeInteger(limit) && limit > 0 ? limit : 0];
             }));
+            return finish(true);
           } catch { /* keep the last valid catalog */ }
           finish();
         });
       }
     );
-    req.on("error", finish);
+    req.on("error", () => finish());
     req.end();
   }).finally(() => { modelRefresh = null; });
   return modelRefresh;
 }
 
-// Prefer what the live model list advertises. But when `supported` is empty —
-// cold start, or :4141 unreachable during a network blip — an unfiltered
-// preference list is still far better than falling through to the caller's
-// unmapped id, which is a dash-form Copilot always 400s on. So in that case
-// take the first preference: it is a real dot-form id Copilot serves.
-function pick(prefs) {
-  for (const p of prefs) if (supported.has(p)) return p;
-  return supported.size === 0 ? prefs[0] : null;
+// Claude model families Copilot serves, newest-first parsing for fallbacks.
+// Copilot spells ids in dot-form (claude-opus-5.5); Anthropic/Claude Code use
+// dash-form (claude-opus-5-5). Both parse to the same {family, major, minor}.
+const FAMILY_RE = /^claude-(opus|sonnet|haiku|fable)-(\d+)(?:[.-](\d+))?$/;
+function parseClaude(id) {
+  const m = typeof id === "string" ? FAMILY_RE.exec(id) : null;
+  return m ? { family: m[1], major: +m[2], minor: m[3] === undefined ? 0 : +m[3] } : null;
 }
-const defaultOpus = () => pick(["claude-opus-5.5", "claude-opus-5-5", "claude-opus-5", "claude-opus-4.8", "claude-opus-4.7", "claude-opus-4.6", "claude-opus-4.5"]);
-const defaultSonnet = () => pick(["claude-sonnet-4.6", "claude-sonnet-4.5"]);
-const defaultHaiku = () => pick(["claude-haiku-4.5", "claude-haiku-4"]);
 
 // id suffixes Copilot exposes as request-time params, not standalone models.
 const VARIANT_RE = /-(?:low|medium|high|xhigh|max|1m)(?:-internal)?$/;
 
-// Real Copilot output ceilings (copilot-api's /v1/models hides capabilities, so
-// we fall back to these verified values). Older 4.5-class models cap at 32k;
-// opus/sonnet 4.6+ and haiku 4.5 at 64k. Sending more yields HTTP 400.
+// Newest model of a family in the live catalog (variant ids excluded).
+function newestServed(family) {
+  let best = null, bestP = null;
+  for (const id of supported) {
+    if (VARIANT_RE.test(id)) continue;
+    const p = parseClaude(id);
+    if (!p || p.family !== family) continue;
+    if (!bestP || p.major > bestP.major || (p.major === bestP.major && p.minor > bestP.minor)) {
+      best = id; bestP = p;
+    }
+  }
+  return best;
+}
+
+// Used only while no catalog has loaded yet (cold start / :4141 unreachable):
+// real Copilot dot-form ids (docs.github.com supported-models, 2026-10-12).
+// Haiku 5.5 is GA in Copilot as of 2026-10-07 (gradual rollout); cold-start
+// matches ANTHROPIC_DEFAULT_HAIKU_MODEL. Watchdog still probes haiku-4.5.
+const COLD_START = {
+  opus: "claude-opus-5.5", sonnet: "claude-sonnet-5.5",
+  haiku: "claude-haiku-5.5", fable: "claude-fable-5.1",
+};
+function familyDefault(family) {
+  return newestServed(family) || (supported.size === 0 ? COLD_START[family] : null);
+}
+
+// Output ceilings for known ids when the catalog carries no limits (copilot-api
+// 0.7.0's /v1/models strips `capabilities`, so this table is what applies in
+// practice). Values never exceed the previously verified 64k; ids not listed
+// fall back to modelCeiling(). Sending more than a model allows yields HTTP 400.
+const KNOWN_MAX_OUTPUT = {
+  "claude-sonnet-4.6": 32000,
+  "claude-haiku-4.5": 64000,
+  "claude-opus-4.8": 64000,
+  "claude-opus-5": 64000,
+  "claude-sonnet-5": 64000,
+  "claude-opus-5.5": 64000,
+  "claude-sonnet-5.5": 64000,
+  "claude-haiku-5.5": 64000,
+  "claude-fable-5": 64000,
+  "claude-fable-5.1": 64000,
+};
 function modelCeiling(id) {
   if (typeof id !== "string") return 32000;
-  if (/claude-(opus|sonnet)-4\.5$/.test(id)) return 32000;
+  const p = parseClaude(id);
+  const dotId = p ? `claude-${p.family}-${p.major}${p.minor ? "." + p.minor : ""}` : id;
+  if (KNOWN_MAX_OUTPUT[id]) return KNOWN_MAX_OUTPUT[id];
+  if (KNOWN_MAX_OUTPUT[dotId]) return KNOWN_MAX_OUTPUT[dotId];
+  if (/claude-(opus|sonnet)-4\.5$/.test(dotId)) return 32000;
   if (/^claude-/.test(id)) return 64000;
   return 32000;
+}
+function outputCeiling(id) {
+  return modelMaxOut.get(id) || modelCeiling(id);
 }
 
 // Copilot rejects `thinking` / `reasoning_effort` for models that don't support
 // reasoning effort — notably the haiku family (small/fast). This matters here
 // because patch_copilot_api() translates `thinking:{enabled}` into
-// reasoning_effort:"high" for ALL models, and ANTHROPIC_SMALL_FAST_MODEL is
-// typically a haiku: background tasks then send opus-shaped effort to a haiku,
-// which 400s with invalid_reasoning_effort. So after the id is settled, drop
-// effort fields for models that can't take them. Opus/sonnet keep thinking.
+// reasoning_effort:"high" for ALL models, and the background (haiku) model
+// would then 400 with invalid_reasoning_effort. So after the id is settled,
+// drop effort fields for models that can't take them. Opus/sonnet keep thinking.
 function supportsEffort(id) {
   if (typeof id !== "string") return true;
   if (/haiku/i.test(id)) return false;
@@ -255,43 +310,114 @@ function supportsEffort(id) {
 // the dot-form Copilot accepts (handled in normalize()).
 const SENTINEL_DATE = "20260301";
 function forwardId(id) {
-  const m = /^claude-(opus|sonnet|haiku)-(\d+)\.(\d+)$/.exec(id);
-  return m ? `claude-${m[1]}-${m[2]}-${m[3]}-${SENTINEL_DATE}` : id;
+  const m = /^claude-(opus|sonnet|haiku|fable)-(\d+)(?:\.(\d+))?$/.exec(id);
+  if (!m) return id;
+  return `claude-${m[1]}-${m[2]}${m[3] === undefined ? "" : "-" + m[3]}-${SENTINEL_DATE}`;
 }
 
-function normalize(model) {
+// Some Copilot accounts (org policy) have no Claude models at all; their model
+// list is GPT/Grok only. Forwarding a Claude request then yields an opaque
+// 400 model_not_supported, so answer it here with an actionable message.
+const NO_CLAUDE_CODE = "copilot_no_claude_models";
+const NO_CLAUDE_MESSAGE = "This Copilot account has no Claude models enabled; ask your org admin to enable them in Copilot policy. (Copilot's model list for this account contains no claude-* ids; Codex/GPT models are unaffected.)";
+function hasClaudeModels() {
+  for (const id of supported) if (/^claude-/.test(id)) return true;
+  return false;
+}
+function isClaudeRequest(model) {
+  if (typeof model !== "string") return false;
+  const base = model.trim().replace(/\[[^\]]*\]\s*$/, "").toLowerCase();
+  return base.startsWith("claude") || /^(opus|sonnet|haiku|fable)$/.test(base);
+}
+
+// Map a client model id to one Copilot serves.
+//   * An id the catalog lists (either spelling) is used exactly.
+//   * Claude Code aliases resolve to Anthropic's newest ids (sonnet ->
+//     claude-sonnet-5-5, haiku -> claude-haiku-5-5), and saved settings can hold
+//     retired ids. If the catalog is loaded and the requested version is not in
+//     it, use the newest SERVED model of the same family (fable falls back to
+//     opus) instead of forwarding an id that can only 400.
+//   * `exact` (header x-cck-exact-model: 1, used by the installer self-tests)
+//     disables that substitution so verification never passes on another model.
+//   * With no catalog yet, send the canonical dot-form id unchanged.
+function normalize(model, exact = false) {
   if (typeof model !== "string" || !model) return model;
   let base = model.trim().replace(/\[[^\]]*\]\s*$/, "");         // strip "[1m]"
   base = base.replace(/-\d{8}$/, "");                            // strip date sentinel
   if (supported.has(base)) return base;
-  const dotted = base.replace(/^claude-(opus|sonnet|haiku)-(\d+)-(\d+)/, "claude-$1-$2.$3");
+  const dotted = base.replace(/^claude-(opus|sonnet|haiku|fable)-(\d+)-(\d+)$/, "claude-$1-$2.$3");
   if (supported.has(dotted)) return dotted;
   // Prefer the exact upstream spelling, including newer dash-form model ids.
-  const dashed = dotted.replace(/^(claude-(?:opus|sonnet|haiku)-\d+)\.(\d+)$/, "$1-$2");
+  const dashed = dotted.replace(/^(claude-(?:opus|sonnet|haiku|fable)-\d+)\.(\d+)$/, "$1-$2");
   if (supported.has(dashed)) return dashed;
-  // Never silently substitute another generation for an explicit version.
-  if (/^claude-(opus|sonnet|haiku)-\d+(?:\.\d+)?$/.test(dotted)) return dotted;
-  // If dash->dot rewriting actually changed the id, the input was a dash-form
-  // claude id (e.g. claude-opus-4-8) and `dotted` is the canonical dot-form
-  // Copilot serves (claude-opus-4.8). Return it UNCONDITIONALLY — even when the
-  // `supported` set hasn't loaded yet (cold start, or :4141 briefly unreachable
-  // during a network blip). Without this, an empty `supported` falls through to
-  // the fallbacks below, which return `base` (the dash form) and 400 with
-  // model_not_supported. On a flaky link this was ~10% of rewrites.
-  if (dotted !== base) return dotted;
+  const p = parseClaude(dotted);
+  if (p) {
+    if (exact || supported.size === 0) return dotted;
+    const alt = newestServed(p.family) || (p.family === "fable" ? newestServed("opus") : null);
+    if (alt) {
+      console.error(`[normalize] ${dotted} is not served by this Copilot account; using ${alt}`);
+      return alt;
+    }
+    return dotted;
+  }
   const low = base.toLowerCase();
-  if (low.includes("haiku")) return defaultHaiku() || defaultOpus() || base;
-  if (low.includes("sonnet")) return defaultSonnet() || defaultOpus() || base;
-  if (low.includes("opus")) return defaultOpus() || base;
-  if (!low.startsWith("claude")) return base;                  // gpt-*/gemini-* pass through
-  return defaultOpus() || base;
+  if (!low.startsWith("claude") && !/^(opus|sonnet|haiku|fable)$/.test(low)) return base;  // gpt-*/gemini-* pass through
+  for (const family of ["haiku", "sonnet", "fable", "opus"]) {
+    if (low.includes(family)) {
+      return familyDefault(family) || (family !== "opus" ? familyDefault("opus") : null) || base;
+    }
+  }
+  return familyDefault("opus") || base;
+}
+
+// Forwarded requests get a connect timeout and an IDLE timeout, never a total
+// one: a long streaming answer keeps the timer reset with every chunk, while a
+// wedged upstream that sends nothing for UPSTREAM_IDLE_MS is cut off instead of
+// hanging the client forever. Stream errors on either side end the response
+// cleanly instead of crashing the process; a client that goes away aborts the
+// upstream request.
+const UPSTREAM_IDLE_MS = 300000;
+const UPSTREAM_CONNECT_MS = 10000;
+function upstreamFailed(res, e, what) {
+  if (res.writableEnded || res.destroyed) return;   // client already gone/done
+  const msg = `${what}: ${(e && e.message) || e}`;
+  console.error(`[proxy] ${msg}`);
+  if (!res.headersSent) {
+    res.writeHead(502, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { message: msg } }));
+  } else {
+    res.destroy();
+  }
+}
+function forwardLocal(res, opts, body, onResponse) {
+  let connectTimer = null;
+  const up = http.request(opts, (ur) => {
+    clearTimeout(connectTimer);
+    ur.on("error", (e) => upstreamFailed(res, e, "normalizer upstream error"));
+    ur.on("aborted", () => upstreamFailed(res, new Error("upstream closed mid-response"), "normalizer upstream error"));
+    onResponse(ur);
+  });
+  connectTimer = setTimeout(() => up.destroy(new Error("connect timeout")), UPSTREAM_CONNECT_MS);
+  up.on("socket", (sock) => {
+    if (!sock.connecting) clearTimeout(connectTimer);
+    else sock.once("connect", () => clearTimeout(connectTimer));
+  });
+  up.setTimeout(UPSTREAM_IDLE_MS, () =>
+    up.destroy(new Error(`no upstream activity for ${UPSTREAM_IDLE_MS / 1000}s`)));
+  up.on("error", (e) => { clearTimeout(connectTimer); upstreamFailed(res, e, "normalizer upstream error"); });
+  up.on("close", () => clearTimeout(connectTimer));
+  res.on("close", () => { if (!res.writableFinished) up.destroy(); });
+  up.end(body);
 }
 
 const server = http.createServer((req, res) => {
   const chunks = [];
+  req.on("error", () => {});
   req.on("data", (c) => chunks.push(c));
   req.on("end", async () => {
     let body = Buffer.concat(chunks);
+    // Installer self-tests ask for the exact model (no family substitution).
+    const exact = req.headers["x-cck-exact-model"] === "1";
     if (Date.now() - lastFetch > 30000) await refreshModels();
 
     // --- Responses API passthrough (Codex etc.) ---------------------------
@@ -314,7 +440,7 @@ const server = http.createServer((req, res) => {
             return;
           }
           if (typeof j.model === "string") {
-            const fixed = normalize(j.model);
+            const fixed = normalize(j.model, exact);
             if (fixed !== j.model) { console.error(`[responses] ${j.model} -> ${fixed}`); j.model = fixed; }
           }
           // Copilot's Responses endpoint rejects OpenAI hosted tools (e.g.
@@ -337,21 +463,40 @@ const server = http.createServer((req, res) => {
         res.end(JSON.stringify({ error: { message: "responses passthrough: " + e.message } }));
         return;
       }
+      const ac = new AbortController();
+      let idle = null;
+      const done = () => clearTimeout(idle);
+      const bump = () => {
+        done();
+        idle = setTimeout(() => ac.abort(new Error(`no upstream activity for ${UPSTREAM_IDLE_MS / 1000}s`)), UPSTREAM_IDLE_MS);
+      };
+      res.on("close", () => { done(); if (!res.writableFinished) ac.abort(new Error("client closed")); });
+      bump();
       try {
         const up = await fetch(auth.api + "/responses", {
           method: "POST",
           headers: copilotHeaders(auth.token, req.headers["accept"]),
           body,
+          signal: ac.signal,
         });
+        bump();
         const h = {};
         const ct = up.headers.get("content-type");
         if (ct) h["content-type"] = ct;
         res.writeHead(up.status, h);
-        if (up.body) Readable.fromWeb(up.body).pipe(res);
-        else res.end(await up.text());
+        if (up.body) {
+          const rs = Readable.fromWeb(up.body);
+          rs.on("data", bump);
+          rs.on("end", done);
+          rs.on("error", (e) => { done(); upstreamFailed(res, e, "responses upstream error"); });
+          rs.pipe(res);
+        } else {
+          res.end(await up.text());
+          done();
+        }
       } catch (e) {
-        res.writeHead(502, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: { message: "responses upstream error: " + e.message } }));
+        done();
+        upstreamFailed(res, e, "responses upstream error");
       }
       return;
     }
@@ -360,8 +505,10 @@ const server = http.createServer((req, res) => {
     if (req.method === "GET" && req.url.startsWith("/v1/models")) {
       const gh = { ...req.headers };
       delete gh["host"];
-      const up = http.request(
+      delete gh["x-cck-exact-model"];
+      forwardLocal(res,
         { host: UPSTREAM_HOST, port: UPSTREAM_PORT, path: req.url, method: "GET", headers: gh },
+        undefined,
         (ur) => {
           const ch = [];
           ur.on("data", (c) => ch.push(c));
@@ -380,13 +527,12 @@ const server = http.createServer((req, res) => {
             delete h["content-encoding"];
             delete h["transfer-encoding"];
             h["content-length"] = Buffer.byteLength(out);
+            if (res.writableEnded || res.destroyed) return;
             res.writeHead(ur.statusCode, h);
             res.end(out);
           });
         }
       );
-      up.on("error", (e) => { res.writeHead(502); res.end("normalizer upstream error: " + e.message); });
-      up.end();
       return;
     }
 
@@ -395,8 +541,16 @@ const server = http.createServer((req, res) => {
       try {
         const j = JSON.parse(body.toString("utf8"));
         let changed = false;
+        if (/^\/(v1\/)?messages\b/.test(req.url) && j && isClaudeRequest(j.model) &&
+            supported.size > 0 && !hasClaudeModels()) {
+          console.error(`[normalize] ${j.model}: no Claude models on this Copilot account`);
+          res.writeHead(400, { "content-type": "application/json" });
+          res.end(JSON.stringify({ type: "error", error: {
+            type: "invalid_request_error", code: NO_CLAUDE_CODE, message: NO_CLAUDE_MESSAGE } }));
+          return;
+        }
         if (j && typeof j.model === "string") {
-          const fixed = normalize(j.model);
+          const fixed = normalize(j.model, exact);
           if (fixed && fixed !== j.model) {
             console.error(`[normalize] ${j.model} -> ${fixed}`);
             j.model = fixed;
@@ -421,11 +575,12 @@ const server = http.createServer((req, res) => {
         // Maximize the output budget so tool_use arguments can never get cut
         // off mid-stream. A starved budget truncates a long tool call, leaving
         // an unclosed input_json_delta -> the harness leaks <invoke> as text or
-        // reports "command missing". Pin max_tokens to the model's real ceiling
-        // (per Copilot: 32k/64k) so even the longest pipeline fits; clamp down
-        // if a client asked for more than the model allows (avoids HTTP 400).
-        const ceiling = modelMaxOut.get(j.model) || modelCeiling(j.model);
-        // Keep the non-streaming default, but never exceed upstream limits.
+        // reports "command missing". Pin max_tokens to the model's ceiling
+        // (upstream metadata when present, else KNOWN_MAX_OUTPUT / 32k-64k) so
+        // even the longest pipeline fits; clamp down if a client asked for more
+        // than the model allows (avoids HTTP 400).
+        const ceiling = outputCeiling(j.model);
+        // Non-streaming requests keep a 16k default, never above the ceiling.
         const maxOut = j.stream === false ? Math.min(16000, ceiling) : ceiling;
         if (j.max_tokens !== maxOut) {
           console.error(`[normalize] max_tokens ${j.max_tokens} -> ${maxOut}`);
@@ -453,21 +608,24 @@ const server = http.createServer((req, res) => {
     const headers = { ...req.headers };
     headers["content-length"] = Buffer.byteLength(body);
     delete headers["host"];
-    const up = http.request(
+    delete headers["x-cck-exact-model"];
+    forwardLocal(res,
       { host: UPSTREAM_HOST, port: UPSTREAM_PORT, path: req.url, method: req.method, headers },
-      (ur) => { res.writeHead(ur.statusCode, ur.headers); ur.pipe(res); }
+      body,
+      (ur) => {
+        if (res.writableEnded || res.destroyed) { ur.resume(); return; }
+        res.writeHead(ur.statusCode, ur.headers);
+        ur.pipe(res);
+      }
     );
-    up.on("error", (e) => {
-      res.writeHead(502, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: { message: "normalizer upstream error: " + e.message } }));
-    });
-    up.end(body);
   });
 });
 
+// Loopback only, regardless of HOST in the environment.
+const LISTEN_HOST = "127.0.0.1";
 refreshModels().finally(() => {
-  server.listen(LISTEN_PORT, "127.0.0.1", () => {
-    console.error(`model-normalizer listening on http://127.0.0.1:${LISTEN_PORT} -> :${UPSTREAM_PORT}`);
+  server.listen(LISTEN_PORT, LISTEN_HOST, () => {
+    console.error(`model-normalizer listening on http://${LISTEN_HOST}:${LISTEN_PORT} -> :${UPSTREAM_PORT}`);
   });
 });
 NORMALIZER_EOF
@@ -531,12 +689,18 @@ alive() { curl -fsS -m 5 "http://localhost:$1/v1/models" >/dev/null 2>&1; }
 # End-to-end Claude health: use a dash-form id so rewriting is exercised too.
 works_claude() {
   local out
-  out="$(curl -fsS -m 25 "http://localhost:$NORM_PORT/v1/messages" \
+  out="$(curl -sS -m 25 "http://localhost:$NORM_PORT/v1/messages" \
     -H 'content-type: application/json' -H 'x-api-key: dummy' \
     -H 'anthropic-version: 2023-06-01' \
     -d '{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"ping"}]}' \
     2>/dev/null)" || return 1
-  case "$out" in *'"type":"message"'*) return 0 ;; *) return 1 ;; esac
+  case "$out" in
+    *'"type":"message"'*) return 0 ;;
+    # The chain works; the account just has no Claude models (org policy).
+    # Restarting or re-authorizing cannot fix that, so don't.
+    *copilot_no_claude_models*) log "Copilot account has no Claude models enabled (org policy); proxy is healthy"; return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 # End-to-end Codex health: Responses is forwarded straight to Copilot by the
@@ -732,8 +896,10 @@ if (s !== original) {
   try {
     fs.writeFileSync(tmp, s, { mode: fs.statSync(f).mode });
     fs.renameSync(tmp, f);
-  } finally {
-    if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch {}
+    console.error(`could not write ${f}: ${e.code || e.message} (try re-running with write access to the npm global dir)`);
+    process.exit(2);
   }
 }
 console.log(s === original ? "extended-thinking patch already verified" : "extended-thinking patch applied and verified");
@@ -756,14 +922,22 @@ THINKING_PATCH_EOF
 # process. Idempotent; re-applies after every reinstall.
 patch_token_refresh() {
   local m; m="$(npm root -g 2>/dev/null)/copilot-api/dist/main.js"
-  [ -f "$m" ] || return 0
-  local js; js="$(mktemp -t cck-refresh)"
-  cat > "$js" <<'REFRESH_PATCH_EOF'
+  if [ ! -f "$m" ]; then
+    warn "token-refresh crash fix NOT verified: copilot-api bundle not found"
+    return 0
+  fi
+  # Script goes in on stdin (no temp file, so no mktemp portability issues and
+  # no way to end up running node with an empty script path).
+  if "${NODE_BIN:-node}" - "$m" <<'REFRESH_PATCH_EOF'
 const f = process.argv[2], fs = require("fs");
 let s = fs.readFileSync(f, "utf8");
-if (s.includes("__cck_refresh_retry")) process.exit(0);
+if (s.includes("__cck_refresh_retry")) { console.log("token-refresh patch already verified"); process.exit(0); }
 const re = /consola\.error\("Failed to refresh Copilot token:", error\);\s*throw error;/;
-if (!re.test(s)) process.exit(1);
+const hits = s.match(new RegExp(re.source, "g")) || [];
+if (hits.length !== 1) {
+  console.error("Upstream bundle does not match the supported token-refresh patch; no changes written.");
+  process.exit(1);
+}
 s = s.replace(re, [
   'consola.error("Failed to refresh Copilot token (__cck_refresh_retry):", error);',
   'globalThis.__cck_refresh_retry = (globalThis.__cck_refresh_retry || 0) + 1;',
@@ -772,14 +946,22 @@ s = s.replace(re, [
   'globalThis.__cck_refresh_retry = 0; consola.info("Copilot token recovered after retry"); } ',
   'catch (e) { consola.error("Copilot token retry failed:", e); } }, __d).unref?.();'
 ].join(""));
-fs.writeFileSync(f, s);
+const tmp = f + ".cck-tmp." + process.pid;
+try {
+  fs.writeFileSync(tmp, s, { mode: fs.statSync(f).mode });
+  fs.renameSync(tmp, f);
+} catch (e) {
+  try { fs.unlinkSync(tmp); } catch {}
+  console.error(`could not write ${f}: ${e.code || e.message} (try re-running with write access to the npm global dir)`);
+  process.exit(2);
+}
+console.log("token-refresh patch applied and verified");
 REFRESH_PATCH_EOF
-  if node "$js" "$m" 2>/dev/null; then
-    ok "patched copilot-api token refresh (backoff, no crash)"
+  then
+    ok "copilot-api token-refresh patch verified (backoff, no crash)"
   else
-    warn "token-refresh patch skipped"
+    warn "token-refresh crash fix NOT verified; unsupported upstream bundle or write failure (see above)"
   fi
-  rm -f "$js"
 }
 
 write_plist() {  # $1=path $2=label $3..=program args
@@ -801,6 +983,8 @@ ${args}  </array>
   <dict>
     <key>PATH</key>
     <string>${NODE_DIR}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOST</key>
+    <string>${BIND_HOST}</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -849,6 +1033,10 @@ write_watchdog_plist() {
 </dict>
 </plist>
 EOF
+}
+
+plist_binds_loopback() {  # $1=plist; true if its env pins HOST to BIND_HOST
+  [ -f "$1" ] && tr -d ' \t\n' < "$1" | grep -qF "<key>HOST</key><string>${BIND_HOST}</string>"
 }
 
 load_service() {  # $1=plist $2=label
@@ -912,9 +1100,15 @@ Object.assign(d.env, {
   // by ANTHROPIC_MODEL"), so you can't change effort. The normalizer maps
   // whatever model id the app sends, so pinning is unnecessary.
   // Defaults keep /model usable; an explicit saved model selection wins.
+  // The sonnet/haiku aliases are pinned to the newest Claude ids Copilot
+  // serves; the normalizer falls back to the newest served id of the same
+  // family if a seat doesn't have them yet (instead of a 400).
   ANTHROPIC_DEFAULT_OPUS_MODEL: "claude-opus-5-5",
+  ANTHROPIC_DEFAULT_SONNET_MODEL: "claude-sonnet-5-5",
+  ANTHROPIC_DEFAULT_HAIKU_MODEL: "claude-haiku-5-5",
   ANTHROPIC_DEFAULT_MODEL: "opus",
-  ANTHROPIC_SMALL_FAST_MODEL: "claude-haiku-4.5",
+  // Deprecated name for the haiku slot; kept for older Claude Code builds.
+  ANTHROPIC_SMALL_FAST_MODEL: "claude-haiku-5-5",
   CLAUDE_CODE_DISABLE_LEGACY_MODEL_REMAP: "1",
   CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: "1",
   DISABLE_PROMPT_CACHING: "1",
@@ -927,11 +1121,25 @@ console.log("  merged env into " + path + (fs.existsSync(path + ".bak") ? " (bac
 NODE_EOF
 }
 
-smoke_test() {  # test Opus 5.5 explicitly, without a fallback to older Opus
+NO_CLAUDE_HINT="This Copilot account has no Claude models enabled; ask your org admin to enable them in Copilot policy."
+claude_models_available() {  # 0 = Claude ids listed, 1 = list has none, 2 = unknown
+  local out node
+  node="${NODE_BIN:-$(find_node)}" || return 2
+  out="$(curl -fsS -m 10 "http://127.0.0.1:${API_PORT}/v1/models" 2>/dev/null)" || return 2
+  printf '%s' "$out" | "$node" -e '
+    let s=""; process.stdin.on("data", c => s+=c); process.stdin.on("end", () => {
+      let ids; try { ids=(JSON.parse(s).data||[]).map(m => m && m.id).filter(i => typeof i === "string"); } catch { process.exit(2); }
+      if (!ids.length) process.exit(2);
+      process.exit(ids.some(i => /^claude-/.test(i)) ? 0 : 1);
+    });'
+}
+
+smoke_test() {  # test Opus 5.5 explicitly (x-cck-exact-model: no fallback to older Opus)
   local out node
   node="${NODE_BIN:-$(find_node)}" || return 1
   out="$(curl -fsS -m 30 "http://localhost:${NORM_PORT}/v1/messages" \
     -H 'content-type: application/json' -H 'x-api-key: dummy' -H 'anthropic-version: 2023-06-01' \
+    -H 'x-cck-exact-model: 1' \
     -d '{"model":"claude-opus-5-5","stream":false,"max_tokens":1024,"messages":[{"role":"user","content":"ping"}]}' 2>/dev/null)" || return 1
   printf '%s' "$out" | "$node" -e '
     let s=""; process.stdin.on("data", c => s+=c); process.stdin.on("end", () => {
@@ -949,9 +1157,11 @@ write_codex_profile() {
 # Written by copilot-claude-kit (bash install.sh --with-codex).
 # A self-contained Codex profile — use it with:   codex --profile copilot
 # It routes Codex through the local proxy to GitHub Copilot's Responses API,
-# which is how GPT-6 Astra and GPT-5.x models are served. Edit 'model' to taste.
+# which is how GPT-6.x and GPT-5.x models are served. Edit 'model' to taste;
+# the picker lists the models that passed a live probe at install time.
 model = "$CODEX_DESKTOP_MODEL"
 model_provider = "copilot"
+model_catalog_json = "$CODEX_PROFILE_CATALOG"
 approval_policy = "on-request"
 approvals_reviewer = "user"
 sandbox_mode = "workspace-write"
@@ -991,7 +1201,7 @@ select_codex_models() {
   local model
   codex_smoke_test "$CODEX_DESKTOP_MODEL" || die "$CODEX_DESKTOP_MODEL failed its Responses check; Codex config was not changed. Check connectivity/account access, or use --codex-model gpt-5.6-sol."
   CODEX_VERIFIED_MODELS=("$CODEX_DESKTOP_MODEL")
-  for model in gpt-6-astra gpt-5.6-sol gpt-5.5; do
+  for model in "${CODEX_MODEL_CHOICES[@]}"; do
     [ "$model" != "$CODEX_DESKTOP_MODEL" ] || continue
     if codex_smoke_test "$model"; then
       CODEX_VERIFIED_MODELS+=("$model")
@@ -1028,8 +1238,13 @@ prepare_codex_catalog_backup() {
 }
 
 write_codex_catalog() {
-  local tmp="${CODEX_CATALOG}.tmp.$$"
   prepare_codex_catalog_backup
+  build_codex_catalog "$CODEX_CATALOG"
+}
+
+build_codex_catalog() {  # $1 = destination catalog path
+  local dest="$1" tmp="${1}.tmp.$$"
+  mkdir -p "$(dirname "$dest")"
   cat > "$tmp" <<'CATALOG_EOF'
 {
   "models": [
@@ -1073,16 +1288,26 @@ const [path, ...ids] = process.argv.slice(2);
 if (!ids.length) throw new Error("No verified Codex models");
 const catalog = JSON.parse(fs.readFileSync(path, "utf8"));
 const template = catalog.models[0];
-const names = { "gpt-6-astra": "GPT-6 Astra", "gpt-5.6-sol": "GPT-5.6 Sol", "gpt-5.5": "GPT-5.5" };
+const names = {
+  "gpt-6.1-sol": "GPT-6.1 Sol", "gpt-6-astra": "GPT-6 Astra", "gpt-6-sol": "GPT-6 Sol",
+  "gpt-6-luna": "GPT-6 Luna", "gpt-5.6-sol": "GPT-5.6 Sol", "gpt-5.6-sol-fast": "GPT-5.6 Sol Fast",
+  "gpt-5.6-terra": "GPT-5.6 Terra", "gpt-5.6-luna": "GPT-5.6 Luna",
+  "gpt-5.5": "GPT-5.5", "gpt-5.4": "GPT-5.4", "gpt-5.3-codex": "GPT-5.3-Codex",
+};
+// GPT-6.x and GPT-5.6 accept low..max; GPT-5.5 and older stop at xhigh.
+const noMax = new Set(["gpt-5.5", "gpt-5.4", "gpt-5.3-codex"]);
+const levelsFor = (slug) => template.supported_reasoning_levels
+  .filter((l) => !(noMax.has(slug) && l.effort === "max"));
 // Keep the existing conservative proxy context budget. OpenAI's direct API
 // context window is not evidence of the window available on a Copilot seat.
 catalog.models = ids.map((slug, i) => ({ ...template, slug,
-  display_name: `${names[slug] || slug} (Copilot)`, priority: i + 1 }));
+  display_name: `${names[slug] || slug} (Copilot)`, priority: i + 1,
+  supported_reasoning_levels: levelsFor(slug) }));
 fs.writeFileSync(path, JSON.stringify(catalog, null, 2) + "\n");
 CATALOG_MODELS_EOF
   [ "$?" -eq 0 ] || { rm -f "$tmp"; die "couldn't build model catalog"; }
-  mv "$tmp" "$CODEX_CATALOG" || die "couldn't write $CODEX_CATALOG"
-  ok "wrote Codex model catalog: $CODEX_CATALOG"
+  mv "$tmp" "$dest" || die "couldn't write $dest"
+  ok "wrote Codex model catalog: $dest"
 }
 
 merge_codex_desktop_config() {
@@ -1350,7 +1575,8 @@ APPROVAL_TEST_EOF
 do_with_codex() {
   do_install codex
   step "Setting up Codex (GitHub Copilot via Responses API)"
-  codex_smoke_test "$CODEX_DESKTOP_MODEL" || die "$CODEX_DESKTOP_MODEL failed its Responses check; Codex profile was not changed"
+  select_codex_models
+  build_codex_catalog "$CODEX_PROFILE_CATALOG"
   write_codex_profile
   printf '%s\n' "$CODEX_DESKTOP_MODEL" > "$CODEX_WATCHDOG_MODEL_FILE"
   if codex_smoke_test; then ok "Codex round-trip through :$NORM_PORT/v1/responses succeeded"; else warn "Codex self-test didn't complete; the proxy is up — try 'codex --profile copilot'"; fi
@@ -1422,6 +1648,8 @@ do_install() {
   write_normalizer
 
   step "Creating background services (launchd)"
+  # Always rewritten (and reloaded below), so re-running over an older install
+  # also picks up the loopback-only HOST binding.
   write_plist "$API_PLIST" "com.copilot-api" "$COPILOT_API_BIN" "start"
   write_plist "$NORM_PLIST" "com.copilot-api-normalize" "$NODE_BIN" "$NORMALIZER"
   load_service "$API_PLIST" "com.copilot-api"
@@ -1490,7 +1718,13 @@ do_install() {
     merge_settings || die "could not write Claude settings"
 
     step "End-to-end self-test"
-    if smoke_test; then
+    local claude_rc=0
+    claude_models_available || claude_rc=$?
+    if [ "$claude_rc" -eq 1 ]; then
+      smoke_rc=1
+      err "$NO_CLAUDE_HINT"
+      warn "Claude settings are in place and will work once Claude models are enabled; Codex/GPT models are unaffected (bash install.sh --with-codex)."
+    elif smoke_test; then
       ok "Opus 5.5 round-trip through :$NORM_PORT succeeded"
     else
       smoke_rc=1
@@ -1518,6 +1752,9 @@ do_verify() {
   if service_loaded com.copilot-api-normalize; then ok "launchd: com.copilot-api-normalize loaded"; else err "launchd: com.copilot-api-normalize NOT loaded"; fail=1; fi
   if service_loaded com.copilot-api-watchdog; then ok "launchd: com.copilot-api-watchdog loaded"; else warn "launchd: com.copilot-api-watchdog NOT loaded (auto-heal off; re-run: bash install.sh)"; fi
 
+  if plist_binds_loopback "$API_PLIST"; then ok "copilot-api bound to $BIND_HOST only"
+  else err "copilot-api plist has no HOST=$BIND_HOST, so :$API_PORT listens on all interfaces (re-run: bash install.sh)"; fail=1; fi
+
   if curl -fsS -m 3 "http://localhost:$API_PORT/v1/models" >/dev/null 2>&1; then ok ":$API_PORT copilot-api responding"; else err ":$API_PORT copilot-api not responding"; fail=1; fi
   if curl -fsS -m 3 "http://localhost:$NORM_PORT/v1/models" >/dev/null 2>&1; then ok ":$NORM_PORT normalizer responding"; else err ":$NORM_PORT normalizer not responding"; fail=1; fi
 
@@ -1535,7 +1772,10 @@ do_verify() {
     fi
     [ "$install_mode" != "combined" ] || ok "watchdog mode: Claude Messages + Codex Responses"
     step "Claude end-to-end self-test"
-    if smoke_test; then ok "Opus 5.5 round-trip through :$NORM_PORT succeeded"; else err "smoke test failed — check /tmp/com.copilot-api.err"; fail=1; fi
+    local claude_rc=0
+    claude_models_available || claude_rc=$?
+    if [ "$claude_rc" -eq 1 ]; then err "$NO_CLAUDE_HINT"; fail=1
+    elif smoke_test; then ok "Opus 5.5 round-trip through :$NORM_PORT succeeded"; else err "smoke test failed — check /tmp/com.copilot-api.err"; fail=1; fi
   fi
 
   if [ "$install_mode" = "combined" ] && ! grep -qF "$CODEX_ROOT_BEGIN" "$CODEX_CONFIG" 2>/dev/null; then
@@ -1585,7 +1825,7 @@ const path = process.argv[2];
 let d; try { d = JSON.parse(fs.readFileSync(path, "utf8")); } catch { process.exit(0); }
 if (d && d.env) {
   fs.copyFileSync(path, path + ".bak");
-  for (const k of ["ANTHROPIC_BASE_URL","ANTHROPIC_AUTH_TOKEN","ANTHROPIC_MODEL","ANTHROPIC_DEFAULT_OPUS_MODEL","ANTHROPIC_DEFAULT_MODEL","ANTHROPIC_SMALL_FAST_MODEL",
+  for (const k of ["ANTHROPIC_BASE_URL","ANTHROPIC_AUTH_TOKEN","ANTHROPIC_MODEL","ANTHROPIC_DEFAULT_OPUS_MODEL","ANTHROPIC_DEFAULT_SONNET_MODEL","ANTHROPIC_DEFAULT_HAIKU_MODEL","ANTHROPIC_DEFAULT_MODEL","ANTHROPIC_SMALL_FAST_MODEL",
                     "CLAUDE_CODE_DISABLE_LEGACY_MODEL_REMAP","CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS",
                     "DISABLE_PROMPT_CACHING","CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"]) delete d.env[k];
   if (Object.keys(d.env).length === 0) delete d.env;
@@ -1598,6 +1838,9 @@ NODE_EOF
 
   if [ -f "$CODEX_PROFILE" ]; then
     rm -f "$CODEX_PROFILE" && ok "removed Codex profile ($CODEX_PROFILE)"
+  fi
+  if [ -f "$CODEX_PROFILE_CATALOG" ]; then
+    rm -f "$CODEX_PROFILE_CATALOG" && ok "removed Codex profile catalog ($CODEX_PROFILE_CATALOG)"
   fi
   if { [ -f "$CODEX_CONFIG" ] && grep -qF "$CODEX_ROOT_BEGIN" "$CODEX_CONFIG" 2>/dev/null; } \
       || [ -e "$CODEX_CATALOG_BACKUP" ] || [ -e "$CODEX_CATALOG_CREATED_MARKER" ]; then
@@ -1618,7 +1861,10 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     --codex-model)
       [ "$#" -ge 2 ] || die "--codex-model requires a model id"
-      case "$2" in gpt-6-astra|gpt-5.6-sol|gpt-5.5) CODEX_DESKTOP_MODEL="$2" ;; *) die "Supported selections: gpt-6-astra, gpt-5.6-sol, gpt-5.5" ;; esac
+      case " ${CODEX_MODEL_CHOICES[*]} " in
+        *" $2 "*) CODEX_DESKTOP_MODEL="$2" ;;
+        *) die "Supported selections: ${CODEX_MODEL_CHOICES[*]}" ;;
+      esac
       case "$COMMAND" in --with-codex|with-codex|--with-codex-desktop|with-codex-desktop) ;; *) die "--codex-model requires a Codex install mode" ;; esac
       shift 2 ;;
     *) die "Unknown argument: $1" ;;
