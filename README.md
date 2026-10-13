@@ -37,14 +37,22 @@ curl -fsSL https://raw.githubusercontent.com/H1an1/copilot-claude-kit/main/insta
 
 Restart Claude afterward. New sessions default to `opus` unless you already
 saved a model selection; use `/model opus` to switch that selection. The
-installer maps the Opus alias to `claude-opus-5-5` via
-`ANTHROPIC_DEFAULT_OPUS_MODEL` and sets `ANTHROPIC_DEFAULT_MODEL=opus` without
-locking `ANTHROPIC_MODEL`. Other models remain selectable.
+installer maps the aliases to the newest Claude models Copilot serves —
+`opus` → `claude-opus-5-5`, `sonnet` → `claude-sonnet-5-5`, `haiku` →
+`claude-haiku-5-5` (`ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL`, plus the
+deprecated `ANTHROPIC_SMALL_FAST_MODEL` for older Claude Code) — and sets
+`ANTHROPIC_DEFAULT_MODEL=opus` without locking `ANTHROPIC_MODEL`. Other models
+remain selectable.
 
 The normalizer accepts dash/dot IDs, dated picker IDs, and `[1m]` suffixes,
-using the spelling advertised by the upstream model list. The installer
-and `--verify` explicitly test Opus 5.5; failure is reported, never hidden by
-substituting an older Opus. A failed Opus self-test returns a nonzero exit status
+using the spelling advertised by the upstream model list. If a requested Claude
+version is not in your account's live model list (for example Haiku 5.5 while
+it is still rolling out, or a retired id saved in settings), it uses the newest
+served model of the same family and logs the substitution, instead of
+forwarding an id that can only return `400 model_not_supported`. The installer
+and `--verify` explicitly test Opus 5.5 with that substitution disabled
+(`x-cck-exact-model: 1`); failure is reported, never hidden by substituting an
+older Opus. A failed Opus self-test returns a nonzero exit status
 while leaving the configuration available for diagnosis. The watchdog still uses a small Haiku probe
 for general proxy health, so it does not certify Opus access.
 
@@ -57,6 +65,37 @@ use an up-to-date client for always-on thinking and the changed tool protocol.
 The adapter preserves thinking data and does not rewrite forced tool choices
 into different behavior. A `[1m]` label alone does not establish the context
 window exposed through Copilot.
+
+## Models
+
+What Copilot serves depends on your plan and your organization's model policy;
+the proxy only routes what your account can already use. Copilot's docs list
+display names, not API ids, so the ids below come from the models.dev catalog
+and GitHub's changelog. Ids marked *needs live check* have not been confirmed
+against a live account yet. Ids marked **live-verified** completed a real
+`/responses` request (including streaming on `gpt-6-astra`) through this proxy on
+a Linux test run on 2026-10-08. Claude ids could not be verified there: that
+account's Copilot policy enables no Claude models.
+
+| Client | Copilot id | Endpoint | Notes / source |
+| --- | --- | --- | --- |
+| Claude | `claude-opus-5.5` | `/v1/messages` → `/chat/completions` | default `opus`; Pro+ and up ([changelog 2026-09-22](https://github.blog/changelog/2026-09-22-claude-opus-5-5-is-now-available-in-github-copilot/)) |
+| Claude | `claude-sonnet-5.5` | same | default `sonnet` ([changelog 2026-09-28](https://github.blog/changelog/2026-09-28-claude-sonnet-5-5-in-github-copilot/)) — *needs live check* |
+| Claude | `claude-haiku-5.5` | same | default `haiku`; gradual rollout ([changelog 2026-10-07](https://github.blog/changelog/2026-10-07-claude-haiku-5-5-in-github-copilot/)) — *needs live check* |
+| Claude | `claude-fable-5.1`, `claude-fable-5` | same | admin must enable; not default-enabled — *needs live check* |
+| Claude | `claude-opus-5`, `claude-sonnet-5`, `claude-opus-4.8`, `claude-haiku-4.5` | same | still served; old ids keep working |
+| Claude | `claude-sonnet-4.6` | same | retired 2026-09-01 except annual plans; unserved requests fall back to the newest Sonnet |
+| Codex | `gpt-6.1-sol` | `/responses` | **live-verified** ([changelog 2026-09-29](https://github.blog/changelog/2026-09-29-gpt-6-1-sol-in-github-copilot/)) |
+| Codex | `gpt-6-astra` (default), `gpt-6-sol`, `gpt-6-luna` | `/responses` | **live-verified** ([weekly release 2026-09-25](https://github.blog/changelog/2026-09-25-github-copilot-weekly-releases-september-21/)) |
+| Codex | `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.5`, `gpt-5.3-codex` | `/responses` | **live-verified**; `gpt-5.5` reports itself as `gpt-5.5-2026-04-23`; `gpt-5.3-codex` is the LTS model |
+| Codex | `gpt-5.6-luna`, `gpt-5.6-sol-fast` | `/responses` | listed in Copilot's live model list, **not yet verified** over `/responses`; offered only if the install-time probe succeeds |
+
+Sources: [Copilot supported models](https://docs.github.com/en/copilot/reference/ai-models/supported-models),
+[Anthropic models overview](https://platform.claude.com/docs/en/models/overview),
+[OpenAI model docs](https://developers.openai.com/api/docs/models/gpt-6.1-sol),
+[models.dev](https://models.dev/api.json). Retired in Copilot: Opus 4.7
+(2026-10-02), Opus 4.5/4.6 and Sonnet 4.5 (2026-09-01). Opus 4.8 fast mode has
+no confirmed API id yet, so the kit does not configure it.
 
 ## What it does
 
@@ -79,7 +118,12 @@ The installer:
    message, and hides `-1m` / `-high` variants from the model picker — so you
    never hit `400 model_not_supported`.
 3. Runs both as always-on background services (launchd: start on login,
-   auto-restart).
+   auto-restart), **bound to 127.0.0.1 only**. copilot-api has no host flag and
+   otherwise listens on every interface, which would expose an unauthenticated,
+   Copilot-token-backed API to your network; the plist sets `HOST=127.0.0.1`,
+   and the normalizer binds loopback in code. Re-running the installer rewrites
+   and reloads the plists, so older installs get the fix; `--verify` flags a
+   plist without it.
 4. Adds a **watchdog** that every 90s sends a real 1-token completion through
    the whole chain — not a `GET /v1/models`, which copilot-api serves from a
    cache that never expires and so answers `200` long after the token has died.
@@ -117,8 +161,11 @@ curl -fsSL https://raw.githubusercontent.com/H1an1/copilot-claude-kit/main/insta
 It installs the proxy, asks that person to authorize **their own** GitHub
 account once, configures Claude Code for Opus 5.5, verifies `gpt-6-astra`,
 safely merges the user-level Codex configuration,
-and writes a model catalog. It also probes `gpt-5.6-sol` and `gpt-5.5` and adds
-those that complete a real Responses request to the Desktop model picker.
+and writes a model catalog. It also probes `gpt-6.1-sol`, `gpt-6-sol`,
+`gpt-6-luna`, `gpt-5.6-sol`, `gpt-5.6-sol-fast`, `gpt-5.6-terra`, `gpt-5.6-luna`,
+`gpt-5.5` and `gpt-5.3-codex`, and
+adds those that complete a real Responses request to the Desktop model picker
+(each probe is one small real request on your account).
 It updates both `~/.claude/settings.json` and `~/.codex/config.toml` and runs
 separate Claude and Codex self-tests. The shared watchdog probes both API paths.
 When Codex is installed, it also tests a local shell call and an approval request.
@@ -131,20 +178,23 @@ Claude model probe fails, Codex setup still proceeds and the command returns
 nonzero so the partial failure is visible. A failed Codex model probe leaves
 the Claude configuration in place and stops before changing Codex settings.
 
-The original command now defaults to **GPT-6 Astra**. To choose Sol instead:
+The original command now defaults to **GPT-6 Astra**. To choose GPT-6.1 Sol instead:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/H1an1/copilot-claude-kit/main/install.sh \
-  | bash -s -- --with-codex-desktop --codex-model gpt-5.6-sol
+  | bash -s -- --with-codex-desktop --codex-model gpt-6.1-sol
 ```
 
-`--codex-model` accepts `gpt-6-astra`, `gpt-5.6-sol`, or `gpt-5.5` in either
+`--codex-model` accepts `gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`,
+`gpt-5.6-sol`, `gpt-5.6-sol-fast`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, or
+`gpt-5.3-codex` in either
 Codex install mode. If the selected model fails, installation stops before
 changing Codex configuration; it never silently substitutes another model.
 After restart, use the Desktop model picker to select another verified model.
 Re-run the installer to refresh the catalog when account access changes.
 The catalog retains a conservative 272k context budget for the proxy; it does
-not assume Copilot exposes OpenAI's full direct-API context window.
+not assume Copilot exposes OpenAI's full direct-API context window. GPT-6.x and
+GPT-5.6 list reasoning levels up to `max`; GPT-5.5 and GPT-5.3-Codex stop at `xhigh`.
 
 The merge is deliberately reversible. Existing model/provider values and an
 existing `copilot` provider and approval/sandbox defaults are preserved in-place,
@@ -172,8 +222,10 @@ codex --profile copilot          # run Codex on Copilot
 
 This adds a `/responses` passthrough to the local proxy (copilot-api doesn't
 proxy Responses itself) and writes a self-contained Codex profile at
-`~/.codex/copilot.config.toml` (`model = "gpt-6-astra"`, pointed at the proxy). Your
-base `~/.codex/config.toml` is left untouched — it's a `--profile` overlay.
+`~/.codex/copilot.config.toml` (`model = "gpt-6-astra"`, pointed at the proxy),
+plus `~/.codex/copilot-profile-models.json` listing the models that passed a live
+probe, for the profile's model picker. Your base `~/.codex/config.toml` is left
+untouched — it's a `--profile` overlay.
 
 > ### ⚠️ Extra caution for Codex on a corporate/enterprise Copilot seat
 > The Codex path talks to Copilot's **Responses** endpoint while presenting the
@@ -313,6 +365,34 @@ Escalate in this order:
 
 Specific symptoms:
 
+- **`extended-thinking compatibility NOT verified`** → the installed copilot-api
+  bundle did not match both known patch locations, was missing, or could not be
+  written. The installer reports the limitation instead of claiming success.
+  An unsupported bundle is left unchanged; basic proxy setup can still continue.
+- **A stalled model-list request** → discovery now expires after five seconds
+  and keeps the last valid catalog. Once a valid catalog exists, a failed
+  refresh backs off for 30 seconds; before that (cold start), each request
+  retries discovery. Concurrent client requests share the same refresh, so a
+  stuck lookup cannot indefinitely block proxy startup. This deadline covers
+  model discovery, not model generation.
+- **A hung upstream** → forwarded requests have a connect timeout and a
+  5-minute *idle* timeout (no bytes at all from upstream), never a total
+  timeout, so long streaming answers are not cut off. Upstream stream errors
+  end that response instead of crashing the proxy.
+- **Output limits** → the output ceiling comes from the upstream model
+  metadata when present; otherwise from a built-in table of known Copilot
+  Claude models (32k/64k), then a 32k/64k fallback. Streaming requests use that
+  ceiling; non-streaming requests keep a 16k default, capped by it.
+- **`token-refresh crash fix NOT verified`** → the copilot-api bundle was
+  missing, did not match the known pattern, or could not be written; it is left
+  unchanged.
+- **"This Copilot account has no Claude models enabled"** → Copilot's model
+  list for the account contains no `claude-*` ids (an organization or
+  enterprise policy). The installer and `--verify` report this instead of a
+  raw `400 model_not_supported`, and Claude Code shows the same message from
+  the proxy. Ask your org admin to enable the Claude models in Copilot policy;
+  the Claude settings already written start working once they are. Codex/GPT
+  models are unaffected, and the watchdog does not restart or re-auth over it.
 - **It says "not authorized to Copilot"** → re-run `bash install.sh` and complete
   the browser step.
 - **`400` errors in `claude`** → almost always the normalizer isn't on the path.
