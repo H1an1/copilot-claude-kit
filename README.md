@@ -49,7 +49,11 @@ using the spelling advertised by the upstream model list. If a requested Claude
 version is not in your account's live model list (for example Haiku 5.5 while
 it is still rolling out, or a retired id saved in settings), it uses the newest
 served model of the same family and logs the substitution, instead of
-forwarding an id that can only return `400 model_not_supported`. The installer
+forwarding an id that can only return `400 model_not_supported`. Because
+copilot-api loads the model list once at startup and never refreshes it, a
+retired id can stay listed after Copilot stops serving it; when Copilot rejects
+such an id with `model_not_supported`, the normalizer retries the request once
+on the newest served model of the family and skips that id for an hour. The installer
 and `--verify` explicitly test Opus 5.5 with that substitution disabled
 (`x-cck-exact-model: 1`); failure is reported, never hidden by substituting an
 older Opus. A failed Opus self-test returns a nonzero exit status
@@ -83,18 +87,22 @@ account's Copilot policy enables no Claude models.
 | Claude | `claude-sonnet-5.5` | same | default `sonnet` ([changelog 2026-09-28](https://github.blog/changelog/2026-09-28-claude-sonnet-5-5-in-github-copilot/)) — *needs live check* |
 | Claude | `claude-haiku-5.5` | same | default `haiku`; gradual rollout ([changelog 2026-10-07](https://github.blog/changelog/2026-10-07-claude-haiku-5-5-in-github-copilot/)) — *needs live check* |
 | Claude | `claude-fable-5.1`, `claude-fable-5` | same | admin must enable; not default-enabled — *needs live check* |
-| Claude | `claude-opus-5`, `claude-sonnet-5`, `claude-opus-4.8`, `claude-haiku-4.5` | same | still served; old ids keep working |
+| Claude | `claude-sonnet-5`, `claude-haiku-4.5` | same | still served; old ids keep working |
+| Claude | `claude-opus-5`, `claude-opus-4.8` | same | **deprecated 2026-11-16** ([changelog 2026-10-15](https://github.blog/changelog/2026-10-15-upcoming-deprecation-of-selected-github-copilot-models-in-mid-november/)); Opus 4.8 stays for individual annual-plan subscribers. Copilot suggests Opus 5.5; once an id is gone, requests for it fall back to the newest served Opus |
 | Claude | `claude-sonnet-4.6` | same | retired 2026-09-01 except annual plans; unserved requests fall back to the newest Sonnet |
 | Codex | `gpt-6.1-sol` | `/responses` | **live-verified** ([changelog 2026-09-29](https://github.blog/changelog/2026-09-29-gpt-6-1-sol-in-github-copilot/)) |
 | Codex | `gpt-6-astra` (default), `gpt-6-sol`, `gpt-6-luna` | `/responses` | **live-verified** ([weekly release 2026-09-25](https://github.blog/changelog/2026-09-25-github-copilot-weekly-releases-september-21/)) |
-| Codex | `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.5`, `gpt-5.3-codex` | `/responses` | **live-verified**; `gpt-5.5` reports itself as `gpt-5.5-2026-04-23`; `gpt-5.3-codex` is the LTS model |
+| Codex | `gpt-5.6-sol`, `gpt-5.5`, `gpt-5.3-codex` | `/responses` | **live-verified**; `gpt-5.5` reports itself as `gpt-5.5-2026-04-23`; `gpt-5.3-codex` is the LTS model |
+| Codex | `gpt-5.6-terra` | `/responses` | **deprecated 2026-11-16** ([changelog 2026-10-15](https://github.blog/changelog/2026-10-15-upcoming-deprecation-of-selected-github-copilot-models-in-mid-november/)); suggested alternatives `gpt-6.1-sol` or `gpt-6-luna`. No longer probed or added to the picker; an explicit `--codex-model gpt-5.6-terra` still works until then, with a warning |
 | Codex | `gpt-5.6-luna`, `gpt-5.6-sol-fast` | `/responses` | listed in Copilot's live model list, **not yet verified** over `/responses`; offered only if the install-time probe succeeds |
 
 Sources: [Copilot supported models](https://docs.github.com/en/copilot/reference/ai-models/supported-models),
 [Anthropic models overview](https://platform.claude.com/docs/en/models/overview),
 [OpenAI model docs](https://developers.openai.com/api/docs/models/gpt-6.1-sol),
 [models.dev](https://models.dev/api.json). Retired in Copilot: Opus 4.7
-(2026-10-02), Opus 4.5/4.6 and Sonnet 4.5 (2026-09-01). Opus 4.8 fast mode has
+(2026-10-02), Opus 4.5/4.6 and Sonnet 4.5 (2026-09-01). Deprecated on
+2026-11-16 ([changelog 2026-10-15](https://github.blog/changelog/2026-10-15-upcoming-deprecation-of-selected-github-copilot-models-in-mid-november/)): Opus 4.8 (except individual annual
+plans), Opus 5 and GPT-5.6 Terra. Opus 4.8 fast mode has
 no confirmed API id yet, so the kit does not configure it.
 
 ## What it does
@@ -162,7 +170,7 @@ It installs the proxy, asks that person to authorize **their own** GitHub
 account once, configures Claude Code for Opus 5.5, verifies `gpt-6-astra`,
 safely merges the user-level Codex configuration,
 and writes a model catalog. It also probes `gpt-6.1-sol`, `gpt-6-sol`,
-`gpt-6-luna`, `gpt-5.6-sol`, `gpt-5.6-sol-fast`, `gpt-5.6-terra`, `gpt-5.6-luna`,
+`gpt-6-luna`, `gpt-5.6-sol`, `gpt-5.6-sol-fast`, `gpt-5.6-luna`,
 `gpt-5.5` and `gpt-5.3-codex`, and
 adds those that complete a real Responses request to the Desktop model picker
 (each probe is one small real request on your account).
@@ -186,12 +194,18 @@ curl -fsSL https://raw.githubusercontent.com/H1an1/copilot-claude-kit/main/insta
 ```
 
 `--codex-model` accepts `gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`,
-`gpt-5.6-sol`, `gpt-5.6-sol-fast`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, or
+`gpt-5.6-sol`, `gpt-5.6-sol-fast`, `gpt-5.6-luna`, `gpt-5.5`, or
 `gpt-5.3-codex` in either
-Codex install mode. If the selected model fails, installation stops before
+Codex install mode. `gpt-5.6-terra` is still accepted with a warning until
+Copilot deprecates it on 2026-11-16; pick `gpt-6.1-sol` or `gpt-6-luna` instead. If the selected model fails, installation stops before
 changing Codex configuration; it never silently substitutes another model.
 After restart, use the Desktop model picker to select another verified model.
 Re-run the installer to refresh the catalog when account access changes.
+If the configured Codex model stops being served (for example `gpt-5.6-terra`
+after 2026-11-16), the watchdog checks `gpt-6-astra` (or `gpt-6.1-sol`) once;
+when that works it restarts nothing and shows an hourly notification asking you
+to re-run the installer with another `--codex-model`. Codex itself reports the
+model error; the proxy never silently switches Codex to a different model.
 The catalog retains a conservative 272k context budget for the proxy; it does
 not assume Copilot exposes OpenAI's full direct-API context window. GPT-6.x and
 GPT-5.6 list reasoning levels up to `max`; GPT-5.5 and GPT-5.3-Codex stop at `xhigh`.

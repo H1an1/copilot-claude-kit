@@ -76,7 +76,13 @@ CODEX_DESKTOP_MODEL="gpt-6-astra"
 # Each is probed with a real completion before it is listed in a picker.
 # Live-verified over /responses on 2026-10-08 except gpt-5.6-luna and
 # gpt-5.6-sol-fast (listed by Copilot, not yet exercised); the probe gates them.
-CODEX_MODEL_CHOICES=(gpt-6.1-sol gpt-6-astra gpt-6-sol gpt-6-luna gpt-5.6-sol gpt-5.6-sol-fast gpt-5.6-terra gpt-5.6-luna gpt-5.5 gpt-5.3-codex)
+CODEX_MODEL_CHOICES=(gpt-6.1-sol gpt-6-astra gpt-6-sol gpt-6-luna gpt-5.6-sol gpt-5.6-sol-fast gpt-5.6-luna gpt-5.5 gpt-5.3-codex)
+# Models Copilot has announced for retirement. Still accepted by an explicit
+# --codex-model (with a warning) until they actually stop working, but never
+# probed for or offered in the picker. GitHub changelog 2026-10-15: GPT-5.6
+# Terra is deprecated 2026-11-16; suggested alternatives gpt-6.1-sol, gpt-6-luna.
+CODEX_RETIRING_MODELS=(gpt-5.6-terra)
+CODEX_RETIRING_NOTE="deprecated by GitHub Copilot on 2026-11-16; use gpt-6.1-sol or gpt-6-luna"
 CODEX_PROFILE_CATALOG="$CODEX_DIR/copilot-profile-models.json"
 CODEX_VERIFIED_MODELS=()
 CODEX_WATCHDOG_MODEL_FILE="$KIT_DIR/codex-model"
@@ -235,11 +241,29 @@ function parseClaude(id) {
 // id suffixes Copilot exposes as request-time params, not standalone models.
 const VARIANT_RE = /-(?:low|medium|high|xhigh|max|1m)(?:-internal)?$/;
 
+// Copilot retires models on a date (2026-11-16: claude-opus-4.8, except for
+// individual annual-plan subscribers, and claude-opus-5), but copilot-api
+// loads /models once at startup and never refreshes it, so its catalog keeps
+// listing an id that Copilot now rejects with 400 model_not_supported. An id
+// Copilot rejected that way is treated as unserved for REJECTED_TTL_MS, so
+// family fallbacks skip it even though the stale catalog still lists it.
+const REJECTED_TTL_MS = 3600000;
+const UNSUPPORTED_MODEL_RE = /model_not_supported|model is not supported/i;
+const rejected = new Map();          // id -> time Copilot rejected it
+function isRejected(id) {
+  const t = rejected.get(id);
+  if (t === undefined) return false;
+  if (Date.now() - t < REJECTED_TTL_MS) return true;
+  rejected.delete(id);
+  return false;
+}
+function served(id) { return supported.has(id) && !isRejected(id); }
+
 // Newest model of a family in the live catalog (variant ids excluded).
 function newestServed(family) {
   let best = null, bestP = null;
   for (const id of supported) {
-    if (VARIANT_RE.test(id)) continue;
+    if (VARIANT_RE.test(id) || isRejected(id)) continue;
     const p = parseClaude(id);
     if (!p || p.family !== family) continue;
     if (!bestP || p.major > bestP.major || (p.major === bestP.major && p.minor > bestP.minor)) {
@@ -265,6 +289,8 @@ function familyDefault(family) {
 // 0.7.0's /v1/models strips `capabilities`, so this table is what applies in
 // practice). Values never exceed the previously verified 64k; ids not listed
 // fall back to modelCeiling(). Sending more than a model allows yields HTTP 400.
+// Opus 4.8 and Opus 5 stay: Copilot serves them until 2026-11-16, and Opus 4.8
+// stays available after that for individual annual-plan subscribers.
 const KNOWN_MAX_OUTPUT = {
   "claude-sonnet-4.6": 32000,
   "claude-haiku-4.5": 64000,
@@ -340,16 +366,18 @@ function isClaudeRequest(model) {
 //   * `exact` (header x-cck-exact-model: 1, used by the installer self-tests)
 //     disables that substitution so verification never passes on another model.
 //   * With no catalog yet, send the canonical dot-form id unchanged.
+//   * An id Copilot just rejected as unsupported (see `rejected`) counts as
+//     unserved even if copilot-api's stale catalog still lists it.
 function normalize(model, exact = false) {
   if (typeof model !== "string" || !model) return model;
   let base = model.trim().replace(/\[[^\]]*\]\s*$/, "");         // strip "[1m]"
   base = base.replace(/-\d{8}$/, "");                            // strip date sentinel
-  if (supported.has(base)) return base;
+  if (served(base)) return base;
   const dotted = base.replace(/^claude-(opus|sonnet|haiku|fable)-(\d+)-(\d+)$/, "claude-$1-$2.$3");
-  if (supported.has(dotted)) return dotted;
+  if (served(dotted)) return dotted;
   // Prefer the exact upstream spelling, including newer dash-form model ids.
   const dashed = dotted.replace(/^(claude-(?:opus|sonnet|haiku|fable)-\d+)\.(\d+)$/, "$1-$2");
-  if (supported.has(dashed)) return dashed;
+  if (served(dashed)) return dashed;
   const p = parseClaude(dotted);
   if (p) {
     if (exact || supported.size === 0) return dotted;
@@ -518,7 +546,8 @@ const server = http.createServer((req, res) => {
               const j = JSON.parse(out.toString("utf8"));
               if (Array.isArray(j.data)) {
                 j.data = j.data
-                  .filter((m) => !(typeof m.id === "string" && /^claude-/.test(m.id) && VARIANT_RE.test(m.id)))
+                  .filter((m) => !(typeof m.id === "string" && /^claude-/.test(m.id) &&
+                    (VARIANT_RE.test(m.id) || isRejected(m.id))))
                   .map((m) => (typeof m.id === "string" ? { ...m, id: forwardId(m.id) } : m));
                 out = Buffer.from(JSON.stringify(j), "utf8");
               }
@@ -537,9 +566,11 @@ const server = http.createServer((req, res) => {
     }
 
     // --- Rewrite model id + sanitize messages on POST bodies --------------
+    let retry = null;                  // set when a model_not_supported 400 may be retried
     if (req.method === "POST" && body.length) {
       try {
         const j = JSON.parse(body.toString("utf8"));
+        const clientModel = j && j.model;
         let changed = false;
         if (/^\/(v1\/)?messages\b/.test(req.url) && j && isClaudeRequest(j.model) &&
             supported.size > 0 && !hasClaudeModels()) {
@@ -602,22 +633,59 @@ const server = http.createServer((req, res) => {
           }
         }
         if (changed) body = Buffer.from(JSON.stringify(j), "utf8");
+        // A Claude id the (possibly stale) catalog lists can still be retired
+        // upstream. Retry such a 400 once on the newest served model of the
+        // family. Never in exact mode: self-tests must see the real failure.
+        if (!exact && isClaudeRequest(clientModel) && parseClaude(j.model)) retry = { j, clientModel };
       } catch { /* not JSON; forward untouched */ }
     }
 
     const headers = { ...req.headers };
-    headers["content-length"] = Buffer.byteLength(body);
     delete headers["host"];
     delete headers["x-cck-exact-model"];
-    forwardLocal(res,
-      { host: UPSTREAM_HOST, port: UPSTREAM_PORT, path: req.url, method: req.method, headers },
-      body,
-      (ur) => {
-        if (res.writableEnded || res.destroyed) { ur.resume(); return; }
-        res.writeHead(ur.statusCode, ur.headers);
-        ur.pipe(res);
-      }
-    );
+    const send = (payload, again) => {
+      headers["content-length"] = Buffer.byteLength(payload);
+      forwardLocal(res,
+        { host: UPSTREAM_HOST, port: UPSTREAM_PORT, path: req.url, method: req.method, headers },
+        payload,
+        (ur) => {
+          if (res.writableEnded || res.destroyed) { ur.resume(); return; }
+          if (!again || ur.statusCode !== 400) {
+            res.writeHead(ur.statusCode, ur.headers);
+            ur.pipe(res);
+            return;
+          }
+          const ch = [];
+          ur.on("data", (c) => ch.push(c));
+          ur.on("end", () => {
+            const errBody = Buffer.concat(ch);
+            if (UNSUPPORTED_MODEL_RE.test(errBody.toString("utf8"))) {
+              const { j, clientModel } = again;
+              const failed = j.model;
+              rejected.set(failed, Date.now());
+              const alt = normalize(clientModel);
+              if (alt && alt !== failed && served(alt)) {
+                console.error(`[normalize] Copilot rejected ${failed} as unsupported (retired?); retrying on ${alt}`);
+                j.model = alt;
+                if (typeof j.max_tokens === "number") {
+                  const ceiling = outputCeiling(alt);
+                  j.max_tokens = j.stream === false ? Math.min(16000, ceiling) : ceiling;
+                }
+                send(Buffer.from(JSON.stringify(j), "utf8"), null);
+                return;
+              }
+            }
+            if (res.writableEnded || res.destroyed) return;
+            const h = { ...ur.headers };
+            delete h["transfer-encoding"];
+            h["content-length"] = errBody.length;
+            res.writeHead(ur.statusCode, h);
+            res.end(errBody);
+          });
+        }
+      );
+    };
+    send(body, retry);
   });
 });
 
@@ -673,6 +741,11 @@ UID_N="$(id -u)"
 LOG="/tmp/com.copilot-api-watchdog.log"
 NOTIFY_STAMP="/tmp/com.copilot-api-watchdog.notified"
 NOTIFY_THROTTLE=3600          # seconds between "re-auth needed" notifications
+MODEL_STAMP="/tmp/com.copilot-api-watchdog.model-notified"
+# Widely served Codex models, used only to tell "the chain is down" apart from
+# "the configured Codex model is gone" (retired, e.g. gpt-5.6-terra on
+# 2026-11-16, or blocked by org policy). A restart can't bring a model back.
+CODEX_HEALTH_FALLBACKS="gpt-6-astra gpt-6.1-sol"
 API_PORT=4141                 # copilot-api
 NORM_PORT=4142                # normalizer
 API_LABEL="com.copilot-api"
@@ -714,10 +787,32 @@ works_codex_model() {
   case "$out" in *'"status":"completed"'*|*'"output"'*) return 0 ;; *) return 1 ;; esac
 }
 
+# Throttled (hourly) log line + notification: the configured Codex model fails
+# while another model works through the same chain.
+codex_model_unavailable() {  # $1 = configured model, $2 = model that works
+  local now last=0
+  now="$(date +%s)"
+  [ -f "$MODEL_STAMP" ] && last="$(cat "$MODEL_STAMP" 2>/dev/null || echo 0)"
+  [ $((now - last)) -ge "$NOTIFY_THROTTLE" ] || return 0
+  log "Codex model $1 fails but $2 works: the proxy is healthy and $1 is not served to this Copilot account (retired or blocked by policy); no restart. Re-run the installer with --codex-model to switch (e.g. gpt-6.1-sol)."
+  osascript -e "display notification \"Codex model $1 is no longer served by Copilot. Re-run the installer to pick another model.\" with title \"copilot-api: Codex model unavailable\"" >/dev/null 2>&1 || true
+  printf '%s' "$now" > "$MODEL_STAMP"
+}
+
 works_codex() {
-  local model="gpt-6-astra"
+  local model="gpt-6-astra" alt
   [ ! -f "$HOME/.copilot-api/codex-model" ] || model="$(cat "$HOME/.copilot-api/codex-model")"
-  works_codex_model "$model"
+  works_codex_model "$model" && return 0
+  # One alternative probe (only on failure) keeps a retired or blocked pinned
+  # model from looking like a dead chain, which used to kickstart both daemons
+  # every 90s and send a false "token expired" notification (B2).
+  for alt in $CODEX_HEALTH_FALLBACKS; do
+    [ "$alt" != "$model" ] || continue
+    works_codex_model "$alt" || return 1
+    codex_model_unavailable "$model" "$alt"
+    return 0
+  done
+  return 1
 }
 
 works() {
@@ -1863,7 +1958,10 @@ while [ "$#" -gt 0 ]; do
       [ "$#" -ge 2 ] || die "--codex-model requires a model id"
       case " ${CODEX_MODEL_CHOICES[*]} " in
         *" $2 "*) CODEX_DESKTOP_MODEL="$2" ;;
-        *) die "Supported selections: ${CODEX_MODEL_CHOICES[*]}" ;;
+        *) case " ${CODEX_RETIRING_MODELS[*]} " in
+             *" $2 "*) CODEX_DESKTOP_MODEL="$2"; warn "$2 is $CODEX_RETIRING_NOTE. It stops working then; re-run with another --codex-model before that date." ;;
+             *) die "Supported selections: ${CODEX_MODEL_CHOICES[*]}" ;;
+           esac ;;
       esac
       case "$COMMAND" in --with-codex|with-codex|--with-codex-desktop|with-codex-desktop) ;; *) die "--codex-model requires a Codex install mode" ;; esac
       shift 2 ;;

@@ -737,6 +737,16 @@ curl -s -m 20 http://localhost:4142/v1/messages \
 
 ---
 
+## Model retirements (2026-11-16)
+
+GitHub deprecates **Claude Opus 4.8** (individual annual-plan subscribers keep it), **Claude Opus 5** and
+**GPT-5.6 Terra** across Copilot on 2026-11-16 ([changelog 2026-10-15](https://github.blog/changelog/2026-10-15-upcoming-deprecation-of-selected-github-copilot-models-in-mid-november/)). Suggested alternatives:
+Opus 5.5 for both Opus models, GPT-6.1 Sol or GPT-6 Luna for Terra. The `claude-opus-4.8` values in the manual
+examples above (`ANTHROPIC_MODEL`, `big_pref`, the daily smoke test) predate this; use `claude-opus-5.5` if
+your seat has it. The installer (`install.sh`) needs no change from you: its normalizer falls back to the newest
+served Opus, including when copilot-api's never-refreshed model cache still lists a retired id, and its
+watchdog no longer restarts the daemons when only the pinned Codex model is gone.
+
 ## Known limitations of the Copilot path
 
 - **Context window is 200k, not 1M.** Copilot's `vscode-chat` integration (the one copilot-api uses)

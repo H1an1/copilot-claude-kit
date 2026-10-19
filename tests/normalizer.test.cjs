@@ -18,6 +18,10 @@ function harness(models=[{id:"gpt-6-astra"}], mode='ok') {
         const r=new EventEmitter(); r.statusCode=200; r.headers={};
         r.pipe=res=>res.end('{}');
         if(options.method==='POST') upstream.push({params:{body,headers:options.headers},url:options.path});
+        if(options.method==='POST'&&state.reply){
+          const {status,data}=state.reply(JSON.parse(body.toString()));
+          r.statusCode=status;r.pipe=res=>res.end(data);fn(r);r.emit('data',Buffer.from(data));r.emit('end');return;
+        }
         if(options.path==='/v1/models') {
           state.lookups++;
           if(state.mode==='stall')return;
@@ -349,4 +353,62 @@ test('no false "no Claude" error on a cold start or when Claude is served',async
     await h.post('haiku','/v1/messages',{messages:[{role:'user',content:'hi'}]});
     assert.equal(h.upstream.length,before+1);
   }
+});
+
+// GitHub changelog 2026-10-15: Claude Opus 4.8 (except individual annual plans)
+// and Claude Opus 5 are deprecated 2026-11-16; suggested alternative Opus 5.5.
+test('retired Opus ids fall back to the newest served Opus once the catalog drops them',async()=>{
+  const h=harness([{id:'claude-opus-5.5'},{id:'claude-sonnet-5.5'},{id:'claude-haiku-5.5'}]);await h.eval('refreshModels()');
+  for(const id of ['claude-opus-4-8','claude-opus-4.8','claude-opus-4-8[1m]','claude-opus-4-8-20260301','claude-opus-5','claude-opus-5-20260301','claude-opus-5[1m]'])
+    assert.equal(h.eval(`normalize(${JSON.stringify(id)})`),'claude-opus-5.5',id);
+  // Annual-plan seats that keep Opus 4.8 still get exactly what they asked for.
+  const annual=harness([{id:'claude-opus-4.8'},{id:'claude-opus-5.5'}]);await annual.eval('refreshModels()');
+  assert.equal(annual.eval('normalize("claude-opus-4-8")'),'claude-opus-4.8');
+});
+const NOT_SUPPORTED=JSON.stringify({error:{message:JSON.stringify({error:{message:'The requested model is not supported.',code:'model_not_supported',param:'model',type:'invalid_request_error'}}),type:'error'}});
+function retiringUpstream(h,gone){
+  h.state.reply=(j)=>gone.includes(j.model)?{status:400,data:NOT_SUPPORTED}:{status:200,data:JSON.stringify({type:'message',model:j.model})};
+}
+test('stale catalog: a retired Opus that Copilot rejects is retried once on the newest served Opus',async()=>{
+  // copilot-api caches /models at startup, so after 2026-11-16 it can still list the retired ids.
+  const h=harness([{id:'claude-opus-4.8'},{id:'claude-opus-5'},{id:'claude-opus-5.5'}]);await h.eval('refreshModels()');
+  retiringUpstream(h,['claude-opus-4.8','claude-opus-5']);
+  for(const [input,failed] of [['claude-opus-4-8','claude-opus-4.8'],['claude-opus-5','claude-opus-5']]){
+    const before=h.upstream.length;
+    const r=await h.post(input,'/v1/messages',{stream:true,messages:[{role:'user',content:'hi'}]});
+    assert.equal(r.status,200,input);
+    const sent=h.upstream.slice(before).map(u=>JSON.parse(u.params.body.toString()));
+    assert.deepEqual(sent.map(b=>b.model),[failed,'claude-opus-5.5'],input);
+    assert.equal(sent[1].max_tokens,64000);
+    // Now known to be gone: the next request goes straight to Opus 5.5 and the picker hides it.
+    const again=h.upstream.length;
+    await h.post(input,'/v1/messages',{messages:[{role:'user',content:'hi'}]});
+    assert.deepEqual(h.upstream.slice(again).map(u=>JSON.parse(u.params.body.toString()).model),['claude-opus-5.5']);
+  }
+  const picker=JSON.parse((await h.get('/v1/models')).body).data.map(m=>m.id);
+  assert.deepEqual(picker,['claude-opus-5-5-20260301']);
+  // The rejection expires, so an id Copilot serves again is used again.
+  h.eval('rejected.set("claude-opus-4.8", Date.now() - REJECTED_TTL_MS - 1)');
+  assert.equal(h.eval('normalize("claude-opus-4-8")'),'claude-opus-4.8');
+});
+test('model_not_supported retry never happens in exact mode, for other 400s, or without a served alternative',async()=>{
+  const h=harness([{id:'claude-opus-4.8'},{id:'claude-opus-5.5'}]);await h.eval('refreshModels()');
+  retiringUpstream(h,['claude-opus-4.8']);
+  let before=h.upstream.length;
+  let r=await h.post('claude-opus-4-8','/v1/messages',{messages:[{role:'user',content:'hi'}]},{'x-cck-exact-model':'1'});
+  assert.equal(r.status,400);assert.match(r.body,/model_not_supported/);assert.equal(h.upstream.length,before+1);
+  h.state.reply=()=>({status:400,data:'{"error":{"message":"prompt is too long","type":"error"}}'});
+  before=h.upstream.length;
+  r=await h.post('claude-opus-5-5','/v1/messages',{messages:[{role:'user',content:'hi'}]});
+  assert.equal(r.status,400);assert.match(r.body,/prompt is too long/);assert.equal(h.upstream.length,before+1);
+  // Only the retired id is served (stale): nothing to retry on, the real error is returned.
+  const only=harness([{id:'claude-opus-4.8'}]);await only.eval('refreshModels()');
+  retiringUpstream(only,['claude-opus-4.8']);
+  r=await only.post('opus','/v1/messages',{messages:[{role:'user',content:'hi'}]});
+  assert.equal(r.status,400);assert.match(r.body,/model_not_supported/);assert.equal(only.upstream.length,1);
+});
+test('GPT-5.6 Terra is never silently substituted over Responses',async()=>{
+  const h=harness([{id:'gpt-6.1-sol'},{id:'gpt-6-astra'}]);await h.eval('refreshModels()');
+  await h.post('gpt-5.6-terra','/v1/responses');
+  assert.equal(JSON.parse(h.upstream.at(-1).params.body.toString()).model,'gpt-5.6-terra');
 });

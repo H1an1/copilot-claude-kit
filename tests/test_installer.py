@@ -75,10 +75,33 @@ enabled = false
         self.assertEqual(config.read_text(), 'model = "original"\n')
 
     def test_only_successful_models_in_catalog(self):
-        self.run_shell('codex_smoke_test() { [ "$1" != gpt-5.6-sol ]; }; select_codex_models; write_codex_catalog')
+        self.run_shell('codex_smoke_test() { echo "$1" >> "$HOME/probed"; [ "$1" != gpt-5.6-sol ]; }; select_codex_models; write_codex_catalog')
         models = json.loads((self.home / '.codex/copilot-models.json').read_text())['models']
         self.assertEqual([m['slug'] for m in models],
-                         ['gpt-6-astra','gpt-6.1-sol','gpt-6-sol','gpt-6-luna','gpt-5.6-sol-fast','gpt-5.6-terra','gpt-5.6-luna','gpt-5.5','gpt-5.3-codex'])
+                         ['gpt-6-astra','gpt-6.1-sol','gpt-6-sol','gpt-6-luna','gpt-5.6-sol-fast','gpt-5.6-luna','gpt-5.5','gpt-5.3-codex'])
+        # Retiring models (gpt-5.6-terra, deprecated 2026-11-16) are not probed for the picker.
+        self.assertNotIn('gpt-5.6-terra',(self.home/'probed').read_text().split())
+
+    def test_retiring_codex_model_is_accepted_explicitly_with_a_warning(self):
+        choices=self.run_shell('printf "%s\\n" "${CODEX_MODEL_CHOICES[@]}"').stdout.split()
+        self.assertNotIn('gpt-5.6-terra',choices)
+        script=SOURCE.replace('case "$COMMAND" in\n  ""|install)','echo "parsed:$CODEX_DESKTOP_MODEL"; exit 0\ncase "$COMMAND" in\n  ""|install)')
+        r=subprocess.run(['bash','-c',script,'install.sh','--with-codex-desktop','--codex-model','gpt-5.6-terra'],
+                         env=self.env,capture_output=True,text=True,timeout=30)
+        self.assertEqual(r.returncode,0,r.stderr)
+        self.assertIn('deprecated by GitHub Copilot on 2026-11-16',r.stdout)
+        self.assertIn('gpt-6.1-sol',r.stdout)
+        self.assertEqual(r.stdout.strip().splitlines()[-1],'parsed:gpt-5.6-terra')
+        # An explicit selection is still verified first and kept at the top of the picker.
+        self.run_shell('CODEX_DESKTOP_MODEL=gpt-5.6-terra; codex_smoke_test() { echo "$1" >> "$HOME/probed"; }; select_codex_models; write_codex_catalog')
+        self.assertEqual((self.home/'probed').read_text().split().count('gpt-5.6-terra'),1)
+        models=json.loads((self.home/'.codex/copilot-models.json').read_text())['models']
+        self.assertEqual(models[0]['slug'],'gpt-5.6-terra')
+        self.assertEqual(models[0]['display_name'],'GPT-5.6 Terra (Copilot)')
+        # Other mode validation still applies.
+        r=subprocess.run(['bash',str(ROOT/'install.sh'),'--verify','--codex-model','gpt-5.6-terra'],env=self.env,capture_output=True,text=True)
+        self.assertNotEqual(r.returncode,0)
+        self.assertFalse((self.home/'.copilot-api').exists())
 
     def test_catalog_names_and_reasoning_levels_per_model(self):
         self.run_shell('CODEX_VERIFIED_MODELS=(gpt-6.1-sol gpt-6-astra gpt-5.5 gpt-5.3-codex); write_codex_catalog')
@@ -437,6 +460,69 @@ log() { echo "LOG: $*"; }
 curl() { cat "$HOME/probe"; }
 works_claude''',ok=False)
             self.assertEqual(r.returncode,expected,body)
+
+    def watchdog_script(self):
+        # The whole watchdog with its fixed /tmp paths moved under the temp HOME.
+        source=SOURCE.split("<<'WATCHDOG_EOF'\n")[1].split('\nWATCHDOG_EOF')[0]
+        source=source.replace('/tmp/com.copilot-api-watchdog',str(self.home/'wd'))
+        self.assertNotIn('/tmp/com.',source)
+        script=self.home/'watchdog.sh'; script.write_text(source)
+        bin_=self.home/'bin'; bin_.mkdir(exist_ok=True)
+        # curl: network and sockets are fine; a completion fails for models listed in $HOME/gone.
+        (bin_/'curl').write_text('''#!/usr/bin/env bash
+args="$*"; echo "$args" >> "$HOME/curl-calls"
+case "$args" in *api.github.com*|*/v1/models*) exit 0 ;; esac
+for m in $(cat "$HOME/gone" 2>/dev/null); do
+  case "$args" in *"\\"model\\":\\"$m\\""*) echo '{"error":{"code":"model_not_supported"}}'; exit 22 ;; esac
+done
+case "$args" in *responses*) echo '{"status":"completed","output":[]}' ;; *) echo '{"type":"message"}' ;; esac
+''')
+        for name,body in [('launchctl','echo "$*" >> "$HOME/kicks"'),('osascript','echo "$*" >> "$HOME/notes"'),('sleep',':')]:
+            (bin_/name).write_text('#!/usr/bin/env bash\n'+body+'\n')
+        for f in bin_.iterdir(): f.chmod(0o755)
+        (self.home/'.copilot-api').mkdir(exist_ok=True)
+        return script
+
+    def run_watchdog(self, script, mode, pinned, gone):
+        (self.home/'.copilot-api/watchdog-mode').write_text(mode)
+        (self.home/'.copilot-api/codex-model').write_text(pinned+'\n')
+        (self.home/'gone').write_text(' '.join(gone))
+        for f in ['kicks','notes','curl-calls']: (self.home/f).unlink(missing_ok=True)
+        env=dict(self.env,PATH=f"{self.home/'bin'}:{os.environ['PATH']}")
+        r=subprocess.run(['bash',str(script)],env=env,capture_output=True,text=True,timeout=60)
+        self.assertEqual(r.returncode,0,r.stderr)
+        read=lambda f:(self.home/f).read_text() if (self.home/f).exists() else ''
+        return read('kicks'),read('notes'),read('wd.log')
+
+    def test_watchdog_does_not_restart_storm_on_a_retired_pinned_codex_model(self):
+        script=self.watchdog_script()
+        for mode in ['codex','combined']:
+            (self.home/'wd.model-notified').unlink(missing_ok=True)
+            (self.home/'wd.log').unlink(missing_ok=True)
+            kicks,notes,log=self.run_watchdog(script,mode,'gpt-5.6-terra',['gpt-5.6-terra'])
+            self.assertEqual(kicks,'',mode)
+            self.assertIn('gpt-5.6-terra fails but gpt-6-astra works',log)
+            self.assertNotIn('token likely expired',log)
+            self.assertIn('Codex model gpt-5.6-terra is no longer served',notes)
+            self.assertNotIn('re-auth',notes)
+            # The next 90s run stays quiet: no restart and no repeated notification.
+            kicks,notes,log2=self.run_watchdog(script,mode,'gpt-5.6-terra',['gpt-5.6-terra'])
+            self.assertEqual((kicks,notes,log2),('','',log),mode)
+        # A pinned default that is gone is checked against the next fallback.
+        (self.home/'wd.model-notified').unlink()
+        kicks,notes,log=self.run_watchdog(script,'codex','gpt-6-astra',['gpt-6-astra'])
+        self.assertEqual(kicks,'')
+        self.assertIn('gpt-6-astra fails but gpt-6.1-sol works',log)
+        # A healthy pinned model costs exactly one probe.
+        self.run_watchdog(script,'codex','gpt-5.6-terra',[])
+        self.assertEqual(len((self.home/'curl-calls').read_text().splitlines()),1)
+
+    def test_watchdog_still_restarts_when_every_codex_model_fails(self):
+        script=self.watchdog_script()
+        kicks,notes,log=self.run_watchdog(script,'codex','gpt-5.6-terra',['gpt-5.6-terra','gpt-6-astra','gpt-6.1-sol'])
+        self.assertIn('kickstart -k',kicks)
+        self.assertIn('token likely expired',log)
+        self.assertIn('re-auth',notes)
 
     def test_cli_profile(self):
         self.run_shell('CODEX_DESKTOP_MODEL=gpt-5.6-sol; write_codex_profile')
