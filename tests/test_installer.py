@@ -78,13 +78,16 @@ enabled = false
         self.run_shell('codex_smoke_test() { echo "$1" >> "$HOME/probed"; [ "$1" != gpt-5.6-sol ]; }; select_codex_models; write_codex_catalog')
         models = json.loads((self.home / '.codex/copilot-models.json').read_text())['models']
         self.assertEqual([m['slug'] for m in models],
-                         ['gpt-6-astra','gpt-6.1-sol','gpt-6-sol','gpt-6-luna','gpt-5.6-sol-fast','gpt-5.6-luna','gpt-5.5','gpt-5.3-codex'])
-        # Retiring models (gpt-5.6-terra, deprecated 2026-11-16) are not probed for the picker.
-        self.assertNotIn('gpt-5.6-terra',(self.home/'probed').read_text().split())
+                         ['gpt-6-astra','gpt-6.1-sol','gpt-6-sol','gpt-6-luna','gpt-5.6-sol-fast','gpt-5.6-luna','gpt-5.3-codex'])
+        # Retiring models are not probed for the picker.
+        probed=(self.home/'probed').read_text().split()
+        self.assertNotIn('gpt-5.6-terra',probed)
+        self.assertNotIn('gpt-5.5',probed)
 
     def test_retiring_codex_model_is_accepted_explicitly_with_a_warning(self):
         choices=self.run_shell('printf "%s\\n" "${CODEX_MODEL_CHOICES[@]}"').stdout.split()
         self.assertNotIn('gpt-5.6-terra',choices)
+        self.assertNotIn('gpt-5.5',choices)
         script=SOURCE.replace('case "$COMMAND" in\n  ""|install)','echo "parsed:$CODEX_DESKTOP_MODEL"; exit 0\ncase "$COMMAND" in\n  ""|install)')
         r=subprocess.run(['bash','-c',script,'install.sh','--with-codex-desktop','--codex-model','gpt-5.6-terra'],
                          env=self.env,capture_output=True,text=True,timeout=30)
@@ -92,6 +95,12 @@ enabled = false
         self.assertIn('deprecated by GitHub Copilot on 2026-11-16',r.stdout)
         self.assertIn('gpt-6.1-sol',r.stdout)
         self.assertEqual(r.stdout.strip().splitlines()[-1],'parsed:gpt-5.6-terra')
+        r=subprocess.run(['bash','-c',script,'install.sh','--with-codex-desktop','--codex-model','gpt-5.5'],
+                         env=self.env,capture_output=True,text=True,timeout=30)
+        self.assertEqual(r.returncode,0,r.stderr)
+        self.assertIn('deprecated by GitHub Copilot on 2026-10-19',r.stdout)
+        self.assertIn('gpt-6.1-sol',r.stdout)
+        self.assertEqual(r.stdout.strip().splitlines()[-1],'parsed:gpt-5.5')
         # An explicit selection is still verified first and kept at the top of the picker.
         self.run_shell('CODEX_DESKTOP_MODEL=gpt-5.6-terra; codex_smoke_test() { echo "$1" >> "$HOME/probed"; }; select_codex_models; write_codex_catalog')
         self.assertEqual((self.home/'probed').read_text().split().count('gpt-5.6-terra'),1)
@@ -118,7 +127,7 @@ enabled = false
     def test_cli_accepts_every_listed_codex_model_and_rejects_others(self):
         choices=self.run_shell('printf "%s\\n" "${CODEX_MODEL_CHOICES[@]}"').stdout.split()
         self.assertEqual(choices[0],'gpt-6.1-sol')
-        for model in ['gpt-6.1-sol','gpt-6-luna','gpt-5.3-codex','gpt-5.5','gpt-5.6-luna','gpt-5.6-sol-fast']:
+        for model in ['gpt-6.1-sol','gpt-6-luna','gpt-5.3-codex','gpt-5.6-luna','gpt-5.6-sol-fast']:
             self.assertIn(model,choices)
             # Stop right after argument parsing: never reach an install step.
             script=SOURCE.replace('case "$COMMAND" in\n  ""|install)','echo "parsed:$CODEX_DESKTOP_MODEL"; exit 0\ncase "$COMMAND" in\n  ""|install)')

@@ -76,13 +76,20 @@ CODEX_DESKTOP_MODEL="gpt-6-astra"
 # Each is probed with a real completion before it is listed in a picker.
 # Live-verified over /responses on 2026-10-08 except gpt-5.6-luna and
 # gpt-5.6-sol-fast (listed by Copilot, not yet exercised); the probe gates them.
-CODEX_MODEL_CHOICES=(gpt-6.1-sol gpt-6-astra gpt-6-sol gpt-6-luna gpt-5.6-sol gpt-5.6-sol-fast gpt-5.6-luna gpt-5.5 gpt-5.3-codex)
-# Models Copilot has announced for retirement. Still accepted by an explicit
-# --codex-model (with a warning) until they actually stop working, but never
-# probed for or offered in the picker. GitHub changelog 2026-10-15: GPT-5.6
-# Terra is deprecated 2026-11-16; suggested alternatives gpt-6.1-sol, gpt-6-luna.
-CODEX_RETIRING_MODELS=(gpt-5.6-terra)
-CODEX_RETIRING_NOTE="deprecated by GitHub Copilot on 2026-11-16; use gpt-6.1-sol or gpt-6-luna"
+CODEX_MODEL_CHOICES=(gpt-6.1-sol gpt-6-astra gpt-6-sol gpt-6-luna gpt-5.6-sol gpt-5.6-sol-fast gpt-5.6-luna gpt-5.3-codex)
+# Models Copilot has announced for retirement (or already retired). Still
+# accepted by an explicit --codex-model (with a warning) if the account still
+# serves them, but never probed for or offered in the picker.
+# - gpt-5.5: deprecated 2026-10-19 (changelog that day); use gpt-6.1-sol
+# - gpt-5.6-terra: deprecated 2026-11-16 (changelog 2026-10-15); use gpt-6.1-sol or gpt-6-luna
+CODEX_RETIRING_MODELS=(gpt-5.5 gpt-5.6-terra)
+codex_retiring_note() {
+  case "$1" in
+    gpt-5.5) printf '%s' "deprecated by GitHub Copilot on 2026-10-19; use gpt-6.1-sol" ;;
+    gpt-5.6-terra) printf '%s' "deprecated by GitHub Copilot on 2026-11-16; use gpt-6.1-sol or gpt-6-luna" ;;
+    *) printf '%s' "deprecated by GitHub Copilot; use gpt-6.1-sol or gpt-6-luna" ;;
+  esac
+}
 CODEX_PROFILE_CATALOG="$CODEX_DIR/copilot-profile-models.json"
 CODEX_VERIFIED_MODELS=()
 CODEX_WATCHDOG_MODEL_FILE="$KIT_DIR/codex-model"
@@ -1959,7 +1966,7 @@ while [ "$#" -gt 0 ]; do
       case " ${CODEX_MODEL_CHOICES[*]} " in
         *" $2 "*) CODEX_DESKTOP_MODEL="$2" ;;
         *) case " ${CODEX_RETIRING_MODELS[*]} " in
-             *" $2 "*) CODEX_DESKTOP_MODEL="$2"; warn "$2 is $CODEX_RETIRING_NOTE. It stops working then; re-run with another --codex-model before that date." ;;
+             *" $2 "*) CODEX_DESKTOP_MODEL="$2"; warn "$2 is $(codex_retiring_note "$2"). Prefer another --codex-model unless Copilot still serves this id for your account." ;;
              *) die "Supported selections: ${CODEX_MODEL_CHOICES[*]}" ;;
            esac ;;
       esac

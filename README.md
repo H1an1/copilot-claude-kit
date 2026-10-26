@@ -92,7 +92,8 @@ account's Copilot policy enables no Claude models.
 | Claude | `claude-sonnet-4.6` | same | retired 2026-09-01 except annual plans; unserved requests fall back to the newest Sonnet |
 | Codex | `gpt-6.1-sol` | `/responses` | **live-verified** ([changelog 2026-09-29](https://github.blog/changelog/2026-09-29-gpt-6-1-sol-in-github-copilot/)) |
 | Codex | `gpt-6-astra` (default), `gpt-6-sol`, `gpt-6-luna` | `/responses` | **live-verified** ([weekly release 2026-09-25](https://github.blog/changelog/2026-09-25-github-copilot-weekly-releases-september-21/)) |
-| Codex | `gpt-5.6-sol`, `gpt-5.5`, `gpt-5.3-codex` | `/responses` | **live-verified**; `gpt-5.5` reports itself as `gpt-5.5-2026-04-23`; `gpt-5.3-codex` is the LTS model |
+| Codex | `gpt-5.6-sol`, `gpt-5.3-codex` | `/responses` | **live-verified**; `gpt-5.3-codex` is the LTS model |
+| Codex | `gpt-5.5` | `/responses` | **deprecated 2026-10-19** ([changelog](https://github.blog/changelog/2026-10-19-github-copilot-models-deprecated-on-october-19-2026/)); suggested alternative `gpt-6.1-sol`. No longer probed or added to the picker; an explicit `--codex-model gpt-5.5` still works with a warning if Copilot still serves it |
 | Codex | `gpt-5.6-terra` | `/responses` | **deprecated 2026-11-16** ([changelog 2026-10-15](https://github.blog/changelog/2026-10-15-upcoming-deprecation-of-selected-github-copilot-models-in-mid-november/)); suggested alternatives `gpt-6.1-sol` or `gpt-6-luna`. No longer probed or added to the picker; an explicit `--codex-model gpt-5.6-terra` still works until then, with a warning |
 | Codex | `gpt-5.6-luna`, `gpt-5.6-sol-fast` | `/responses` | listed in Copilot's live model list, **not yet verified** over `/responses`; offered only if the install-time probe succeeds |
 
@@ -100,7 +101,9 @@ Sources: [Copilot supported models](https://docs.github.com/en/copilot/reference
 [Anthropic models overview](https://platform.claude.com/docs/en/models/overview),
 [OpenAI model docs](https://developers.openai.com/api/docs/models/gpt-6.1-sol),
 [models.dev](https://models.dev/api.json). Retired in Copilot: Opus 4.7
-(2026-10-02), Opus 4.5/4.6 and Sonnet 4.5 (2026-09-01). Deprecated on
+(2026-10-02), Opus 4.5/4.6 and Sonnet 4.5 (2026-09-01); GPT-5.5 / GPT-5.4 /
+GPT-5.4 mini / GPT-5 mini / Gemini 3.7 Flash / Grok 4.5 (2026-10-19,
+[changelog](https://github.blog/changelog/2026-10-19-github-copilot-models-deprecated-on-october-19-2026/)). Deprecated on
 2026-11-16 ([changelog 2026-10-15](https://github.blog/changelog/2026-10-15-upcoming-deprecation-of-selected-github-copilot-models-in-mid-november/)): Opus 4.8 (except individual annual
 plans), Opus 5 and GPT-5.6 Terra. Opus 4.8 fast mode has
 no confirmed API id yet, so the kit does not configure it.
@@ -170,8 +173,8 @@ It installs the proxy, asks that person to authorize **their own** GitHub
 account once, configures Claude Code for Opus 5.5, verifies `gpt-6-astra`,
 safely merges the user-level Codex configuration,
 and writes a model catalog. It also probes `gpt-6.1-sol`, `gpt-6-sol`,
-`gpt-6-luna`, `gpt-5.6-sol`, `gpt-5.6-sol-fast`, `gpt-5.6-luna`,
-`gpt-5.5` and `gpt-5.3-codex`, and
+`gpt-6-luna`, `gpt-5.6-sol`, `gpt-5.6-sol-fast`, `gpt-5.6-luna`, and
+`gpt-5.3-codex`, and
 adds those that complete a real Responses request to the Desktop model picker
 (each probe is one small real request on your account).
 It updates both `~/.claude/settings.json` and `~/.codex/config.toml` and runs
@@ -194,10 +197,11 @@ curl -fsSL https://raw.githubusercontent.com/H1an1/copilot-claude-kit/main/insta
 ```
 
 `--codex-model` accepts `gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`,
-`gpt-5.6-sol`, `gpt-5.6-sol-fast`, `gpt-5.6-luna`, `gpt-5.5`, or
+`gpt-5.6-sol`, `gpt-5.6-sol-fast`, `gpt-5.6-luna`, or
 `gpt-5.3-codex` in either
-Codex install mode. `gpt-5.6-terra` is still accepted with a warning until
-Copilot deprecates it on 2026-11-16; pick `gpt-6.1-sol` or `gpt-6-luna` instead. If the selected model fails, installation stops before
+Codex install mode. Retired/retiring ids `gpt-5.5` (deprecated 2026-10-19) and
+`gpt-5.6-terra` (deprecated 2026-11-16) are still accepted with a warning; pick
+`gpt-6.1-sol` or `gpt-6-luna` instead. If the selected model fails, installation stops before
 changing Codex configuration; it never silently substitutes another model.
 After restart, use the Desktop model picker to select another verified model.
 Re-run the installer to refresh the catalog when account access changes.
