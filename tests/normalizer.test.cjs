@@ -69,7 +69,7 @@ test('dedicated reviewer fails locally with manual approval instructions, withou
   }
 });
 test('GPT selections keep their exact id and coding tools',async()=>{
-  for(const model of ['gpt-6.1-sol','gpt-6-astra','gpt-6-sol','gpt-6-luna','gpt-5.6-sol','gpt-5.6-terra','gpt-5.5','gpt-5.3-codex']){
+  for(const model of ['gpt-6.1-sol','gpt-6.1-terra','gpt-6-astra','gpt-6-sol','gpt-6-luna','gpt-5.6-sol','gpt-5.6-terra','gpt-5.5','gpt-5.3-codex']){
     const h=harness();await h.post(model,'/v1/responses',{tools:[{type:'function',name:'shell'},{type:'web_search'}],service_tier:'priority'});
     const request=JSON.parse(h.upstream.at(-1).params.body.toString());
     assert.equal(request.model,model);assert.equal(request.tools.length,1);assert.equal(request.tools[0].name,'shell');assert.equal(request.service_tier,undefined);

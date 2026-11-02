@@ -76,7 +76,7 @@ CODEX_DESKTOP_MODEL="gpt-6-astra"
 # Each is probed with a real completion before it is listed in a picker.
 # Live-verified over /responses on 2026-10-08 except gpt-5.6-luna and
 # gpt-5.6-sol-fast (listed by Copilot, not yet exercised); the probe gates them.
-CODEX_MODEL_CHOICES=(gpt-6.1-sol gpt-6-astra gpt-6-sol gpt-6-luna gpt-5.6-sol gpt-5.6-sol-fast gpt-5.6-luna gpt-5.3-codex)
+CODEX_MODEL_CHOICES=(gpt-6.1-sol gpt-6.1-terra gpt-6-astra gpt-6-sol gpt-6-luna gpt-5.6-sol gpt-5.6-sol-fast gpt-5.6-luna gpt-5.3-codex)
 # Models Copilot has announced for retirement (or already retired). Still
 # accepted by an explicit --codex-model (with a warning) if the account still
 # serves them, but never probed for or offered in the picker.
@@ -1391,7 +1391,7 @@ if (!ids.length) throw new Error("No verified Codex models");
 const catalog = JSON.parse(fs.readFileSync(path, "utf8"));
 const template = catalog.models[0];
 const names = {
-  "gpt-6.1-sol": "GPT-6.1 Sol", "gpt-6-astra": "GPT-6 Astra", "gpt-6-sol": "GPT-6 Sol",
+  "gpt-6.1-sol": "GPT-6.1 Sol", "gpt-6.1-terra": "GPT-6.1 Terra", "gpt-6-astra": "GPT-6 Astra", "gpt-6-sol": "GPT-6 Sol",
   "gpt-6-luna": "GPT-6 Luna", "gpt-5.6-sol": "GPT-5.6 Sol", "gpt-5.6-sol-fast": "GPT-5.6 Sol Fast",
   "gpt-5.6-terra": "GPT-5.6 Terra", "gpt-5.6-luna": "GPT-5.6 Luna",
   "gpt-5.5": "GPT-5.5", "gpt-5.4": "GPT-5.4", "gpt-5.3-codex": "GPT-5.3-Codex",
