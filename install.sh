@@ -286,7 +286,7 @@ function newestServed(family) {
 // matches ANTHROPIC_DEFAULT_HAIKU_MODEL. Watchdog still probes haiku-4.5.
 const COLD_START = {
   opus: "claude-opus-5.5", sonnet: "claude-sonnet-5.5",
-  haiku: "claude-haiku-5.5", fable: "claude-fable-5.1",
+  haiku: "claude-haiku-5.5", fable: "claude-fable-5.2",
 };
 function familyDefault(family) {
   return newestServed(family) || (supported.size === 0 ? COLD_START[family] : null);
@@ -309,6 +309,7 @@ const KNOWN_MAX_OUTPUT = {
   "claude-haiku-5.5": 64000,
   "claude-fable-5": 64000,
   "claude-fable-5.1": 64000,
+  "claude-fable-5.2": 64000,
 };
 function modelCeiling(id) {
   if (typeof id !== "string") return 32000;

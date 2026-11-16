@@ -86,7 +86,7 @@ account's Copilot policy enables no Claude models.
 | Claude | `claude-opus-5.5` | `/v1/messages` → `/chat/completions` | default `opus`; Pro+ and up ([changelog 2026-09-22](https://github.blog/changelog/2026-09-22-claude-opus-5-5-is-now-available-in-github-copilot/)) |
 | Claude | `claude-sonnet-5.5` | same | default `sonnet` ([changelog 2026-09-28](https://github.blog/changelog/2026-09-28-claude-sonnet-5-5-in-github-copilot/)) — *needs live check* |
 | Claude | `claude-haiku-5.5` | same | default `haiku`; gradual rollout ([changelog 2026-10-07](https://github.blog/changelog/2026-10-07-claude-haiku-5-5-in-github-copilot/)) — *needs live check* |
-| Claude | `claude-fable-5.1`, `claude-fable-5` | same | admin must enable; not default-enabled — *needs live check* |
+| Claude | `claude-fable-5.2`, `claude-fable-5.1`, `claude-fable-5` | same | admin must enable; not default-enabled — *needs live check* |
 | Claude | `claude-sonnet-5`, `claude-haiku-4.5` | same | still served; old ids keep working |
 | Claude | `claude-opus-5`, `claude-opus-4.8` | same | **deprecated 2026-11-16** ([changelog 2026-10-15](https://github.blog/changelog/2026-10-15-upcoming-deprecation-of-selected-github-copilot-models-in-mid-november/)); Opus 4.8 stays for individual annual-plan subscribers. Copilot suggests Opus 5.5; once an id is gone, requests for it fall back to the newest served Opus |
 | Claude | `claude-sonnet-4.6` | same | retired 2026-09-01 except annual plans; unserved requests fall back to the newest Sonnet |

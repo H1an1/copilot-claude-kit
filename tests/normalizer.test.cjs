@@ -105,10 +105,10 @@ test('an unserved Claude id falls back to the newest served id of its family (no
   assert.equal(h.eval('normalize("claude-haiku-5-5", true)'),'claude-haiku-5.5');
 });
 test('sonnet/haiku aliases and old ids map to served ids, newest first',async()=>{
-  const ids=['claude-opus-5.5','claude-opus-4.8','claude-sonnet-5.5','claude-sonnet-4.6','claude-haiku-5.5','claude-haiku-4.5','claude-fable-5.1','claude-fable-5'];
+  const ids=['claude-opus-5.5','claude-opus-4.8','claude-sonnet-5.5','claude-sonnet-4.6','claude-haiku-5.5','claude-haiku-4.5','claude-fable-5.2','claude-fable-5.1','claude-fable-5'];
   const h=harness(ids.map(id=>({id})));
   await h.eval('refreshModels()');
-  const cases={sonnet:'claude-sonnet-5.5',haiku:'claude-haiku-5.5',opus:'claude-opus-5.5',fable:'claude-fable-5.1',
+  const cases={sonnet:'claude-sonnet-5.5',haiku:'claude-haiku-5.5',opus:'claude-opus-5.5',fable:'claude-fable-5.2',
     'claude-sonnet-5-5':'claude-sonnet-5.5','claude-haiku-5-5':'claude-haiku-5.5','claude-haiku-5-5-20261001':'claude-haiku-5.5',
     'claude-sonnet-4-6':'claude-sonnet-4.6','claude-haiku-4-5':'claude-haiku-4.5','claude-haiku-4-5-20251001':'claude-haiku-4.5',
     'claude-opus-4-8[1m]':'claude-opus-4.8','claude-fable-5':'claude-fable-5','claude-fable-5-1':'claude-fable-5.1',
@@ -140,7 +140,7 @@ test('haiku requests drop thinking/effort after alias mapping',async()=>{
 });
 test('output budget uses the built-in table when upstream has no limit',async()=>{
   for(const [id,stream,expected] of [['claude-sonnet-4.6',true,32000],['claude-haiku-4.5',true,64000],['claude-haiku-5.5',true,64000],
-      ['claude-opus-5.5',true,64000],['claude-fable-5.1',true,64000],['claude-opus-4.5',true,32000],['claude-sonnet-4.6',false,16000]]){
+      ['claude-opus-5.5',true,64000],['claude-fable-5.1',true,64000],['claude-fable-5.2',true,64000],['claude-opus-4.5',true,32000],['claude-sonnet-4.6',false,16000]]){
     const h=harness([{id}]);await h.eval('refreshModels()');
     await h.post(id,'/v1/messages',{stream,max_tokens:1024,messages:[{role:'user',content:'ping'}]});
     assert.equal(JSON.parse(h.upstream.at(-1).params.body.toString()).max_tokens,expected,id);
