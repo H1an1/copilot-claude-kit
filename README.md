@@ -90,6 +90,7 @@ account's Copilot policy enables no Claude models.
 | Claude | `claude-sonnet-5`, `claude-haiku-4.5` | same | still served; old ids keep working |
 | Claude | `claude-opus-5`, `claude-opus-4.8` | same | **deprecated 2026-11-16** ([changelog 2026-10-15](https://github.blog/changelog/2026-10-15-upcoming-deprecation-of-selected-github-copilot-models-in-mid-november/)); Opus 4.8 stays for individual annual-plan subscribers. Copilot suggests Opus 5.5; once an id is gone, requests for it fall back to the newest served Opus |
 | Claude | `claude-sonnet-4.6` | same | retired 2026-09-01 except annual plans; unserved requests fall back to the newest Sonnet |
+| Codex | `gpt-6.2-astra`, `gpt-6.2-sol` | `/responses` | Copilot GA 2026-11-17 ([changelog](https://github.blog/changelog/2026-11-17-openais-gpt-6-2-astra-and-gpt-6-2-sol-now-available/)); Astra for agentic coding and terminal work, Sol for complex agentic coding and in-depth code review (Pro+/Max/Business/Enterprise, gradual rollout) — *needs live `/responses` check* |
 | Codex | `gpt-6.1-sol` | `/responses` | **live-verified** ([changelog 2026-09-29](https://github.blog/changelog/2026-09-29-gpt-6-1-sol-in-github-copilot/)) |
 | Codex | `gpt-6.1-terra` | `/responses` | Copilot GA 2026-10-26 ([changelog](https://github.blog/changelog/2026-10-26-gpt-6-1-terra-in-github-copilot/)); lower-cost everyday agentic/terminal coding vs GPT-6.1 Sol — *needs live `/responses` check* |
 | Codex | `gpt-6-astra` (default), `gpt-6-sol`, `gpt-6-luna` | `/responses` | **live-verified** ([weekly release 2026-09-25](https://github.blog/changelog/2026-09-25-github-copilot-weekly-releases-september-21/)) |
@@ -173,7 +174,7 @@ curl -fsSL https://raw.githubusercontent.com/H1an1/copilot-claude-kit/main/insta
 It installs the proxy, asks that person to authorize **their own** GitHub
 account once, configures Claude Code for Opus 5.5, verifies `gpt-6-astra`,
 safely merges the user-level Codex configuration,
-and writes a model catalog. It also probes `gpt-6.1-sol`, `gpt-6.1-terra`, `gpt-6-sol`,
+and writes a model catalog. It also probes `gpt-6.2-astra`, `gpt-6.2-sol`, `gpt-6.1-sol`, `gpt-6.1-terra`, `gpt-6-sol`,
 `gpt-6-luna`, `gpt-5.6-sol`, `gpt-5.6-sol-fast`, `gpt-5.6-luna`, and
 `gpt-5.3-codex`, and
 adds those that complete a real Responses request to the Desktop model picker
@@ -197,7 +198,7 @@ curl -fsSL https://raw.githubusercontent.com/H1an1/copilot-claude-kit/main/insta
   | bash -s -- --with-codex-desktop --codex-model gpt-6.1-sol
 ```
 
-`--codex-model` accepts `gpt-6.1-sol`, `gpt-6.1-terra`, `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`,
+`--codex-model` accepts `gpt-6.2-astra`, `gpt-6.2-sol`, `gpt-6.1-sol`, `gpt-6.1-terra`, `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`,
 `gpt-5.6-sol`, `gpt-5.6-sol-fast`, `gpt-5.6-luna`, or
 `gpt-5.3-codex` in either
 Codex install mode. Retired/retiring ids `gpt-5.5` (deprecated 2026-10-19) and

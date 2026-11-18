@@ -78,7 +78,7 @@ enabled = false
         self.run_shell('codex_smoke_test() { echo "$1" >> "$HOME/probed"; [ "$1" != gpt-5.6-sol ]; }; select_codex_models; write_codex_catalog')
         models = json.loads((self.home / '.codex/copilot-models.json').read_text())['models']
         self.assertEqual([m['slug'] for m in models],
-                         ['gpt-6-astra','gpt-6.1-sol','gpt-6.1-terra','gpt-6-sol','gpt-6-luna','gpt-5.6-sol-fast','gpt-5.6-luna','gpt-5.3-codex'])
+                         ['gpt-6-astra','gpt-6.2-astra','gpt-6.2-sol','gpt-6.1-sol','gpt-6.1-terra','gpt-6-sol','gpt-6-luna','gpt-5.6-sol-fast','gpt-5.6-luna','gpt-5.3-codex'])
         # Retiring models are not probed for the picker.
         probed=(self.home/'probed').read_text().split()
         self.assertNotIn('gpt-5.6-terra',probed)
@@ -113,21 +113,25 @@ enabled = false
         self.assertFalse((self.home/'.copilot-api').exists())
 
     def test_catalog_names_and_reasoning_levels_per_model(self):
-        self.run_shell('CODEX_VERIFIED_MODELS=(gpt-6.1-sol gpt-6-astra gpt-5.5 gpt-5.3-codex); write_codex_catalog')
+        self.run_shell('CODEX_VERIFIED_MODELS=(gpt-6.2-astra gpt-6.2-sol gpt-6.1-sol gpt-6-astra gpt-5.5 gpt-5.3-codex); write_codex_catalog')
         models={m['slug']:m for m in json.loads((self.home/'.codex/copilot-models.json').read_text())['models']}
+        self.assertEqual(models['gpt-6.2-astra']['display_name'],'GPT-6.2 Astra (Copilot)')
+        self.assertEqual(models['gpt-6.2-sol']['display_name'],'GPT-6.2 Sol (Copilot)')
         self.assertEqual(models['gpt-6.1-sol']['display_name'],'GPT-6.1 Sol (Copilot)')
         self.assertEqual(models['gpt-5.3-codex']['display_name'],'GPT-5.3-Codex (Copilot)')
         levels=lambda slug:[l['effort'] for l in models[slug]['supported_reasoning_levels']]
+        self.assertEqual(levels('gpt-6.2-astra'),['low','medium','high','xhigh','max'])
+        self.assertEqual(levels('gpt-6.2-sol'),['low','medium','high','xhigh','max'])
         self.assertEqual(levels('gpt-6.1-sol'),['low','medium','high','xhigh','max'])
         self.assertEqual(levels('gpt-6-astra'),['low','medium','high','xhigh','max'])
         self.assertEqual(levels('gpt-5.5'),['low','medium','high','xhigh'])
         self.assertEqual(levels('gpt-5.3-codex'),['low','medium','high','xhigh'])
-        self.assertEqual([m['priority'] for m in models.values()],[1,2,3,4])
+        self.assertEqual([m['priority'] for m in models.values()],[1,2,3,4,5,6])
 
     def test_cli_accepts_every_listed_codex_model_and_rejects_others(self):
         choices=self.run_shell('printf "%s\\n" "${CODEX_MODEL_CHOICES[@]}"').stdout.split()
-        self.assertEqual(choices[0],'gpt-6.1-sol')
-        for model in ['gpt-6.1-sol','gpt-6.1-terra','gpt-6-luna','gpt-5.3-codex','gpt-5.6-luna','gpt-5.6-sol-fast']:
+        self.assertEqual(choices[0],'gpt-6.2-astra')
+        for model in ['gpt-6.2-astra','gpt-6.2-sol','gpt-6.1-sol','gpt-6.1-terra','gpt-6-luna','gpt-5.3-codex','gpt-5.6-luna','gpt-5.6-sol-fast']:
             self.assertIn(model,choices)
             # Stop right after argument parsing: never reach an install step.
             script=SOURCE.replace('case "$COMMAND" in\n  ""|install)','echo "parsed:$CODEX_DESKTOP_MODEL"; exit 0\ncase "$COMMAND" in\n  ""|install)')
